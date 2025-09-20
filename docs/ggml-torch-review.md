@@ -1,0 +1,19 @@
+# ggml::torch architectural review
+
+## Wrapper architecture in context
+* **Tensor/context coupling.** Every `Tensor` carries the originating `Context` and refuses to operate across contexts, ensuring all graph nodes live inside a single ggml arena.【F:include/ggml/torch.h†L28-L145】【F:src/ggml-torch.cpp†L167-L188】 Contexts are reference-counted via `shared_from_this` and own tensor allocation helpers plus convenience constructors for scalars and integer vectors.【F:include/ggml/torch.h†L259-L278】【F:src/ggml-torch.cpp†L37-L214】【F:src/ggml-torch.cpp†L1215-L1279】
+* **Backend layer.** `Backend`, `BackendBuffer`, and `BackendScheduler` provide RAII ownership, placement, and scheduling primitives but stay thin wrappers over the ggml C API, leaving policy decisions to higher layers.【F:include/ggml/torch.h†L147-L257】【F:src/ggml-torch.cpp†L859-L1239】
+* **Module tree and model helper.** Modules register tensors in maps and expose recursive traversal, while `Model` bolts on GGUF ingestion, backend preparation, placement bookkeeping, and a synchronous generation loop that builds a fresh graph each token.【F:include/ggml/torch.h†L288-L545】【F:src/ggml-torch.cpp†L1408-L2269】
+
+## Comparison with llama.cpp patterns
+* **Graph lifecycle.** `Model::generate` allocates a new `ggml_cgraph`, collects tensor placements, reserves the scheduler, and frees everything each iteration, whereas `llama_context` caches `llm_graph_result` instances, supports `graph_reserve`, and updates them in place when topology matches to avoid repeated allocations.【F:src/ggml-torch.cpp†L2200-L2269】【F:src/llama-context.h†L189-L199】【F:src/llama-graph.h†L381-L512】
+* **Backend reuse.** The wrapper synthesizes a CPU backend and optionally instantiates others inferred from parameter buffers on every call to `prepare_execution_backends`, while llama.cpp stores a scheduler and compute buffers in the context constructor for reuse across requests.【F:src/ggml-torch.cpp†L2024-L2068】【F:src/llama-context.h†L23-L37】
+* **KV-cache and auxiliary graphs.** llama.cpp keeps specialized schedulers/graphs for KV cache maintenance (e.g., K-shift) that reuse the global scheduler and graph results, contrasting with the wrapper's lack of cache utilities or scheduler reset logic beyond generic placement.【F:src/llama-kv-cache.cpp†L620-L652】【F:src/ggml-torch.cpp†L2077-L2140】
+* **Execution APIs.** llama.cpp exposes asynchronous graph compute (`graph_compute` wrapping `ggml_backend_sched_graph_compute_async`) and callbacks, while the wrapper only uses synchronous `graph_compute` despite wrapping the async entry points at the backend layer.【F:src/llama-context.h†L189-L199】【F:src/ggml-torch.cpp†L1153-L1239】【F:src/ggml-torch.cpp†L2200-L2263】
+
+## Recommendations
+1. **Adopt graph reuse similar to llama.cpp.** Cache `ggml_cgraph` objects (or higher-level `llm_graph_result` equivalents) and reuse scheduler reservations when the topology is stable to cut per-token allocation overhead.【F:src/ggml-torch.cpp†L2200-L2263】【F:src/llama-graph.h†L485-L512】
+2. **Persist backend configuration.** Move backend discovery and scheduler creation out of the per-token loop, storing them inside `Model` akin to `llama_context` so repeated generations reuse buffers and thread pools.【F:src/ggml-torch.cpp†L2024-L2140】【F:src/llama-context.h†L23-L37】
+3. **Expose cache-friendly helpers.** Provide utilities for KV-cache updates, scheduler resets, or custom graph inserts, mirroring llama.cpp's dedicated routines and unlocking ggml-specific features beyond PyTorch parity.【F:src/llama-kv-cache.cpp†L620-L652】【F:src/ggml-torch.cpp†L2077-L2140】
+4. **Surface asynchronous execution.** Wire `Model` to optionally call `graph_compute_async` and scheduler callbacks to close the gap with llama.cpp's non-blocking execution paths and facilitate overlap with data transfers.【F:src/ggml-torch.cpp†L1153-L1239】【F:src/ggml-torch.cpp†L2200-L2263】
+

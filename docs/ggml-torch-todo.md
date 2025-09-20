@@ -1,0 +1,27 @@
+# ggml::torch API follow-up notes
+
+## Alignment with PyTorch semantics
+* **Tensor surface mirrors torch::Tensor basics.** Naming and signatures for arithmetic (`add`, `mul`, `matmul`), reductions (`sum`, `mean`), reshaping (`view`, `reshape`, `flatten`), and broadcasting helpers (`unsqueeze`, `repeat`, `expand`) closely follow PyTorch and enforce shared-context rules to emulate a single device arena.【F:include/ggml/torch.h†L42-L89】【F:src/ggml-torch.cpp†L167-L334】【F:src/ggml-torch.cpp†L630-L760】
+* **Module hierarchy resembles torch::nn.** `nn::Module` stores parameters/buffers by string key and recurses through submodules, matching PyTorch's parameter traversal patterns.【F:include/ggml/torch.h†L288-L321】【F:src/ggml-torch.cpp†L1408-L1461】 Derived layers (Linear, LayerNorm, RMSNorm, Embedding, MultiheadAttention, FeedForward) expose `forward` methods with inputs matching their PyTorch counterparts.【F:include/ggml/torch.h†L326-L420】【F:src/ggml-torch.cpp†L1465-L1741】
+* **Backend abstractions play a role similar to PyTorch devices.** `Backend`, `BackendBuffer`, and `BackendScheduler` wrap low-level ggml handles to replicate PyTorch's `to(device)` and `torch.compile` placement semantics at the graph level.【F:include/ggml/torch.h†L147-L257】【F:src/ggml-torch.cpp†L859-L1239】
+
+## Notable deviations and pain points
+* **Four-dimensional limit.** All creation and reshape helpers enforce ggml's `GGML_MAX_DIMS == 4`, which diverges from PyTorch's arbitrary dimensional tensors and will surprise users working with 5D convolution or video data.【F:src/ggml-torch.cpp†L37-L55】【F:src/ggml-torch.cpp†L199-L214】
+* **Linear weight layout differs.** `Linear` allocates weights as `[in_features, out_features]` and multiplies `weight.matmul(input)`, while PyTorch stores weights as `[out, in]` and uses `F.linear(input, weight, bias)`; this flips expected shapes for users inspecting raw tensors or porting weights directly.【F:src/ggml-torch.cpp†L1465-L1491】
+* **`addmm` scaling semantics are rigid.** The implementation scales the pre-existing `self` tensor in place using `ggml_scale` before adding the product, assuming the destination already holds data. PyTorch accepts an optional `out` parameter instead of mutating the base tensor, so callers must take care not to reuse temporaries.【F:include/ggml/torch.h†L89-L89】【F:src/ggml-torch.cpp†L600-L611】
+* **Attention API is self-attention only.** `MultiheadAttention::forward` always feeds the same input through Q/K/V projections and cannot accept separate encoder/decoder states like `torch::nn::MultiheadAttention`'s `key`/`value` arguments.【F:src/ggml-torch.cpp†L1709-L1741】
+* **No autograd or training utilities.** `Tensor` lacks gradient storage or `backward()` helpers, and `nn::Module` offers no mode switches (`train()`/`eval()`) or parameter freezing; the wrapper is inference-only today.【F:include/ggml/torch.h†L28-L145】【F:include/ggml/torch.h†L288-L321】
+* **Device/thread control is coarse.** `Backend::cpu(n_threads)` sets thread counts globally, but there is no high-level API for per-operation stream control or asynchronous dispatch beyond `BackendScheduler::graph_compute_async`, which the high-level `Model` does not expose.【F:include/ggml/torch.h†L189-L243】【F:src/ggml-torch.cpp†L1099-L1239】【F:src/ggml-torch.cpp†L2200-L2263】
+
+## Missing PyTorch conveniences worth adding
+1. **Flexible tensor creation helpers.** Add context helpers that mirror `torch::empty`, `zeros`, and `from_blob` to simplify initialization beyond the raw `new_tensor`/`new_i32` methods.【F:include/ggml/torch.h†L270-L275】
+2. **In-place variants and chained operations.** PyTorch offers in-place ops (`add_`, `relu_`); exposing them (or guaranteeing that existing methods return views when possible) would reduce allocations and align ergonomics with PyTorch users.【F:include/ggml/torch.h†L42-L73】
+3. **Expanded attention support.** Accept explicit `key`/`value` tensors and cached states in `MultiheadAttention::forward` to unlock cross-attention and decoder-style caching, matching PyTorch's interface.【F:src/ggml-torch.cpp†L1709-L1741】
+4. **Module state toggles.** Provide `train()`/`eval()` flags and buffer registration hooks (e.g., for dropout masks) to better integrate with PyTorch training flows.【F:include/ggml/torch.h†L288-L321】
+5. **Serializer symmetry.** The GGUF loader is read-only; exposing a GGUF or state_dict exporter would help mimic `torch.save`/`torch.load` workflows.【F:include/ggml/torch.h†L513-L519】【F:src/ggml-torch.cpp†L1792-L2021】
+
+## ggml-specific opportunities not yet surfaced
+* **Quantization controls.** The wrapper allocates weights onto whatever buffer type is inferred from GGUF but does not expose ggml's quantization/dequantization utilities, limiting users who want to quantize programmatically before upload.【F:src/ggml-torch.cpp†L1906-L2068】
+* **Graph reuse and profiling hooks.** `Model::generate` rebuilds and reallocates a graph per token instead of reusing `ggml_cgraph` instances or leveraging `BackendScheduler::set_eval_callback`, leaving performance on the table compared to llama.cpp's cached graphs.【F:src/ggml-torch.cpp†L2200-L2263】【F:src/ggml-torch.cpp†L1153-L1239】
+* **KV-cache management.** There is no high-level API mirroring llama.cpp's KV-cache maintenance despite ggml providing tensor-copy helpers; exposing such utilities would differentiate the wrapper beyond PyTorch compatibility.【F:src/llama-kv-cache.cpp†L620-L652】
+
