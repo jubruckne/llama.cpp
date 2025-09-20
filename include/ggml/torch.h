@@ -51,9 +51,14 @@ public:
     Tensor sum(int64_t dim, bool keepdim = false) const;
     Tensor mean(int64_t dim, bool keepdim = false) const;
     Tensor softmax() const;
+    Tensor softmax(int64_t dim) const;
     Tensor silu() const;
     Tensor gelu(bool approximate = true) const;
     Tensor relu() const;
+    Tensor sigmoid() const;
+    Tensor tanh() const;
+    Tensor elu() const;
+    Tensor leaky_relu(float negative_slope = 0.01f) const;
     Tensor layer_norm(float eps) const;
     Tensor rms_norm(float eps) const;
     Tensor diag_mask_inf(int n_past) const;
@@ -472,6 +477,82 @@ public:
 private:
     Tensor weight_;
     float eps_ = 0.0f;
+};
+
+class ReLU : public nn::Module {
+public:
+    explicit ReLU(std::shared_ptr<Context> context);
+
+    Tensor forward(const Tensor & input) override;
+};
+
+class SiLU : public nn::Module {
+public:
+    explicit SiLU(std::shared_ptr<Context> context);
+
+    Tensor forward(const Tensor & input) override;
+};
+
+class GELU : public nn::Module {
+public:
+    GELU(std::shared_ptr<Context> context, bool approximate = true);
+
+    Tensor forward(const Tensor & input) override;
+
+    bool approximate() const { return approximate_; }
+
+private:
+    bool approximate_ = true;
+};
+
+class Sigmoid : public nn::Module {
+public:
+    explicit Sigmoid(std::shared_ptr<Context> context);
+
+    Tensor forward(const Tensor & input) override;
+};
+
+class Tanh : public nn::Module {
+public:
+    explicit Tanh(std::shared_ptr<Context> context);
+
+    Tensor forward(const Tensor & input) override;
+};
+
+class ELU : public nn::Module {
+public:
+    ELU(std::shared_ptr<Context> context, float alpha = 1.0f);
+
+    Tensor forward(const Tensor & input) override;
+
+    float alpha() const { return alpha_; }
+
+private:
+    float alpha_ = 1.0f;
+};
+
+class LeakyReLU : public nn::Module {
+public:
+    LeakyReLU(std::shared_ptr<Context> context, float negative_slope = 0.01f);
+
+    Tensor forward(const Tensor & input) override;
+
+    float negative_slope() const { return negative_slope_; }
+
+private:
+    float negative_slope_ = 0.01f;
+};
+
+class Softmax : public nn::Module {
+public:
+    Softmax(std::shared_ptr<Context> context, int64_t dim = -1);
+
+    Tensor forward(const Tensor & input) override;
+
+    int64_t dim() const { return dim_; }
+
+private:
+    int64_t dim_ = -1;
 };
 
 class Sequential : public nn::Module {

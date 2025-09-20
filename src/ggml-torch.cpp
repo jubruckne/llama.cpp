@@ -356,6 +356,31 @@ Tensor Tensor::softmax() const {
     return wrap(ggml_soft_max(context_->raw(), tensor_));
 }
 
+Tensor Tensor::softmax(int64_t dim) const {
+    require_defined();
+    auto dims = sizes();
+    if (dims.empty()) {
+        throw std::invalid_argument("softmax expects tensor with at least one dimension");
+    }
+
+    const int axis = normalize_dim(dim, static_cast<int64_t>(dims.size()));
+    if (axis == 0 || dims.size() == 1) {
+        return wrap(ggml_soft_max(context_->raw(), tensor_));
+    }
+
+    Tensor permuted = *this;
+    if (axis != 0) {
+        permuted = permuted.transpose(0, axis);
+    }
+    permuted = permuted.contiguous();
+
+    Tensor result = permuted.softmax();
+    if (axis != 0) {
+        result = result.transpose(0, axis);
+    }
+    return result;
+}
+
 Tensor Tensor::silu() const {
     require_defined();
     return wrap(ggml_silu(context_->raw(), tensor_));
@@ -370,6 +395,26 @@ Tensor Tensor::gelu(bool approximate) const {
 Tensor Tensor::relu() const {
     require_defined();
     return wrap(ggml_relu(context_->raw(), tensor_));
+}
+
+Tensor Tensor::sigmoid() const {
+    require_defined();
+    return wrap(ggml_sigmoid(context_->raw(), tensor_));
+}
+
+Tensor Tensor::tanh() const {
+    require_defined();
+    return wrap(ggml_tanh(context_->raw(), tensor_));
+}
+
+Tensor Tensor::elu() const {
+    require_defined();
+    return wrap(ggml_elu(context_->raw(), tensor_));
+}
+
+Tensor Tensor::leaky_relu(float negative_slope) const {
+    require_defined();
+    return wrap(ggml_leaky_relu(context_->raw(), tensor_, negative_slope, /*inplace=*/false));
 }
 
 Tensor Tensor::layer_norm(float eps) const {
@@ -1613,6 +1658,134 @@ Tensor RMSNorm::forward(const Tensor & input) {
 
     auto result = input.rms_norm(eps_);
     return result.mul(weight_.repeat_like(result));
+}
+
+ReLU::ReLU(std::shared_ptr<Context> context)
+    : Module(std::move(context)) {
+}
+
+Tensor ReLU::forward(const Tensor & input) {
+    if (!input.defined()) {
+        throw std::invalid_argument("ggml::torch::ReLU::forward requires a defined input tensor");
+    }
+    if (&input.context() != ctx().get()) {
+        throw std::invalid_argument("ggml::torch::ReLU::forward expects the input tensor to originate from the same context");
+    }
+    return input.relu();
+}
+
+SiLU::SiLU(std::shared_ptr<Context> context)
+    : Module(std::move(context)) {
+}
+
+Tensor SiLU::forward(const Tensor & input) {
+    if (!input.defined()) {
+        throw std::invalid_argument("ggml::torch::SiLU::forward requires a defined input tensor");
+    }
+    if (&input.context() != ctx().get()) {
+        throw std::invalid_argument("ggml::torch::SiLU::forward expects the input tensor to originate from the same context");
+    }
+    return input.silu();
+}
+
+GELU::GELU(std::shared_ptr<Context> context, bool approximate)
+    : Module(std::move(context)), approximate_(approximate) {
+}
+
+Tensor GELU::forward(const Tensor & input) {
+    if (!input.defined()) {
+        throw std::invalid_argument("ggml::torch::GELU::forward requires a defined input tensor");
+    }
+    if (&input.context() != ctx().get()) {
+        throw std::invalid_argument("ggml::torch::GELU::forward expects the input tensor to originate from the same context");
+    }
+    return input.gelu(approximate_);
+}
+
+Sigmoid::Sigmoid(std::shared_ptr<Context> context)
+    : Module(std::move(context)) {
+}
+
+Tensor Sigmoid::forward(const Tensor & input) {
+    if (!input.defined()) {
+        throw std::invalid_argument("ggml::torch::Sigmoid::forward requires a defined input tensor");
+    }
+    if (&input.context() != ctx().get()) {
+        throw std::invalid_argument("ggml::torch::Sigmoid::forward expects the input tensor to originate from the same context");
+    }
+    return input.sigmoid();
+}
+
+Tanh::Tanh(std::shared_ptr<Context> context)
+    : Module(std::move(context)) {
+}
+
+Tensor Tanh::forward(const Tensor & input) {
+    if (!input.defined()) {
+        throw std::invalid_argument("ggml::torch::Tanh::forward requires a defined input tensor");
+    }
+    if (&input.context() != ctx().get()) {
+        throw std::invalid_argument("ggml::torch::Tanh::forward expects the input tensor to originate from the same context");
+    }
+    return input.tanh();
+}
+
+ELU::ELU(std::shared_ptr<Context> context, float alpha)
+    : Module(std::move(context)), alpha_(alpha) {
+    if (!std::isfinite(alpha_)) {
+        throw std::invalid_argument("ggml::torch::ELU requires a finite alpha value");
+    }
+    if (std::abs(alpha_ - 1.0f) > 1e-6f) {
+        throw std::invalid_argument("ggml::torch::ELU currently supports only alpha = 1.0");
+    }
+}
+
+Tensor ELU::forward(const Tensor & input) {
+    if (!input.defined()) {
+        throw std::invalid_argument("ggml::torch::ELU::forward requires a defined input tensor");
+    }
+    if (&input.context() != ctx().get()) {
+        throw std::invalid_argument("ggml::torch::ELU::forward expects the input tensor to originate from the same context");
+    }
+    return input.elu();
+}
+
+LeakyReLU::LeakyReLU(std::shared_ptr<Context> context, float negative_slope)
+    : Module(std::move(context)), negative_slope_(negative_slope) {
+    if (!std::isfinite(negative_slope_)) {
+        throw std::invalid_argument("ggml::torch::LeakyReLU requires a finite negative slope");
+    }
+}
+
+Tensor LeakyReLU::forward(const Tensor & input) {
+    if (!input.defined()) {
+        throw std::invalid_argument("ggml::torch::LeakyReLU::forward requires a defined input tensor");
+    }
+    if (&input.context() != ctx().get()) {
+        throw std::invalid_argument("ggml::torch::LeakyReLU::forward expects the input tensor to originate from the same context");
+    }
+    return input.leaky_relu(negative_slope_);
+}
+
+Softmax::Softmax(std::shared_ptr<Context> context, int64_t dim)
+    : Module(std::move(context)), dim_(dim) {
+}
+
+Tensor Softmax::forward(const Tensor & input) {
+    if (!input.defined()) {
+        throw std::invalid_argument("ggml::torch::Softmax::forward requires a defined input tensor");
+    }
+    if (&input.context() != ctx().get()) {
+        throw std::invalid_argument("ggml::torch::Softmax::forward expects the input tensor to originate from the same context");
+    }
+
+    int64_t axis = dim_;
+    if (axis == -1) {
+        axis = input.dim() - 1;
+    }
+    const auto dims = input.sizes();
+    axis = normalize_dim(axis, static_cast<int64_t>(dims.size()));
+    return input.softmax(axis);
 }
 
 FeedForward::FeedForward(std::shared_ptr<Context> context,
