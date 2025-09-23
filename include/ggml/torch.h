@@ -297,6 +297,8 @@ public:
 
     Module(const Module &) = delete;
     Module & operator=(const Module &) = delete;
+    Module(Module &&) noexcept = default;
+    Module & operator=(Module &&) noexcept = default;
 
     virtual Tensor forward(const Tensor & input) = 0;
 
@@ -587,42 +589,88 @@ public:
 
     using ConfigMap = std::map<std::string, ConfigValue>;
 
-    using BackendResolver = std::function<const Backend *(const std::string &, const Tensor &)>;
-
     explicit Model(std::shared_ptr<Context> context);
 
-    const ConfigMap & config() const { return config_; }
-    void clear_config();
+    Model(Model &&) noexcept = default;
+    Model & operator=(Model &&) noexcept = default;
+};
 
-    void load_weights_from_gguf(const std::string & path,
-                                BackendResolver resolver = BackendResolver());
+class Generator {
+public:
+    using ConfigMap       = Model::ConfigMap;
+    using ConfigValue     = Model::ConfigValue;
+    using BackendResolver = std::function<const Backend *(const std::string &, const Tensor &)>;
+
+    static Generator create(std::shared_ptr<Model> model,
+                            const std::string & gguf_path,
+                            std::vector<Backend *> backends = {},
+                            BackendResolver resolver = BackendResolver());
+
+    static Generator create(Model & model,
+                            const std::string & gguf_path,
+                            std::vector<Backend *> backends = {},
+                            BackendResolver resolver = BackendResolver());
+
+    Generator(const Generator &) = delete;
+    Generator & operator=(const Generator &) = delete;
+
+    Generator(Generator &&) noexcept = default;
+    Generator & operator=(Generator &&) noexcept = default;
+
+    const ConfigMap & config() const { return config_; }
+    Model       & model() { return *model_; }
+    const Model & model() const { return *model_; }
 
     std::vector<int> generate(std::vector<int> prompt, int n);
 
 private:
-    struct ExecutionBackends {
+    Generator(std::shared_ptr<Model> model, std::vector<Backend> provided_backends);
+
+    void load_weights_from_gguf(const std::string & path, BackendResolver resolver);
+
+    struct GenerationWorkspace {
+        GenerationWorkspace() = default;
+        GenerationWorkspace(const GenerationWorkspace &) = delete;
+        GenerationWorkspace & operator=(const GenerationWorkspace &) = delete;
+        GenerationWorkspace(GenerationWorkspace &&) = default;
+        GenerationWorkspace & operator=(GenerationWorkspace &&) = default;
+
+        void clear() {
+            *this = GenerationWorkspace{};
+        }
+
+        bool empty() const noexcept { return backends.empty(); }
+
         std::vector<Backend> backends;
         std::vector<ggml_backend_buffer_type_t> buffer_types;
         std::unordered_map<ggml_backend_buffer_type_t, size_t> buffer_to_index;
         size_t cpu_index = 0;
-
-        bool empty() const noexcept { return backends.empty(); }
+        BackendScheduler scheduler;
+        std::vector<std::pair<Tensor, size_t>> cached_placements;
+        size_t reserved_graph_nodes = 0;
+        size_t max_graph_nodes = 0;
     };
 
-    ExecutionBackends prepare_execution_backends() const;
-    void collect_tensor_placements(const ExecutionBackends & execution_backends,
+    void prepare_execution_backends(GenerationWorkspace & workspace) const;
+    void collect_tensor_placements(const GenerationWorkspace & workspace,
                                    std::vector<std::pair<Tensor, size_t>> & placements) const;
-    BackendScheduler create_scheduler(const ExecutionBackends & execution_backends,
+    BackendScheduler create_scheduler(const GenerationWorkspace & workspace,
                                       size_t graph_nodes) const;
     void assign_backends(BackendScheduler & scheduler,
-                         const ExecutionBackends & execution_backends,
+                         const GenerationWorkspace & workspace,
                          const std::vector<std::pair<Tensor, size_t>> & placements,
                          const Tensor & input_tokens) const;
     void upload_prompt_tokens(const Tensor & input_tokens, const std::vector<int> & tokens) const;
     int select_next_token(const Tensor & logits) const;
+    GenerationWorkspace & ensure_generation_workspace() const;
+    void invalidate_generation_workspace();
 
+    std::shared_ptr<Model> model_;
     ConfigMap config_;
     std::vector<BackendBuffer> parameter_buffers_;
+    std::vector<Backend> provided_backends_;
+    mutable GenerationWorkspace generation_workspace_;
+    mutable bool generation_workspace_ready_ = false;
 };
 
 } // namespace ggml::torch
