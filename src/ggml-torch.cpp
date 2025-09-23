@@ -1957,12 +1957,54 @@ Model::Model(std::shared_ptr<Context> context)
     : nn::Module(std::move(context)) {
 }
 
-void Model::clear_config() {
-    config_.clear();
-    parameter_buffers_.clear();
+Generator::Generator(std::shared_ptr<Model> model, std::vector<Backend> provided_backends)
+    : model_(std::move(model)),
+      provided_backends_(std::move(provided_backends)) {
+    if (!model_) {
+        throw std::invalid_argument("Generator requires a valid model instance");
+    }
 }
 
-void Model::load_weights_from_gguf(const std::string & path, BackendResolver resolver) {
+Generator Generator::create(std::shared_ptr<Model> model,
+                            const std::string & path,
+                            std::vector<Backend *> backends,
+                            BackendResolver resolver) {
+    if (!model) {
+        throw std::invalid_argument("Generator::create requires a non-null model");
+    }
+
+    std::vector<Backend> provided;
+    provided.reserve(backends.size());
+    for (Backend * backend_ptr : backends) {
+        if (backend_ptr == nullptr) {
+            throw std::invalid_argument("Generator::create received a null backend pointer");
+        }
+        if (!backend_ptr->defined()) {
+            throw std::invalid_argument("Generator::create received an undefined backend");
+        }
+        provided.emplace_back(backend_ptr->raw(), false);
+    }
+
+    Generator generator(std::move(model), std::move(provided));
+    generator.load_weights_from_gguf(path, std::move(resolver));
+    return generator;
+}
+
+Generator Generator::create(Model & model,
+                            const std::string & path,
+                            std::vector<Backend *> backends,
+                            BackendResolver resolver) {
+    std::shared_ptr<nn::Module> base;
+    try {
+        base = model.shared_from_this();
+    } catch (const std::bad_weak_ptr &) {
+        throw std::runtime_error("Generator::create requires the model to be managed by std::shared_ptr");
+    }
+    auto shared_model = std::static_pointer_cast<Model>(base);
+    return create(std::move(shared_model), path, std::move(backends), std::move(resolver));
+}
+
+void Generator::load_weights_from_gguf(const std::string & path, BackendResolver resolver) {
     struct gguf_init_params params {
         /*.no_alloc =*/ true,
         /*.ctx      =*/ nullptr,
@@ -1975,6 +2017,7 @@ void Model::load_weights_from_gguf(const std::string & path, BackendResolver res
 
     config_.clear();
     parameter_buffers_.clear();
+    invalidate_generation_workspace();
 
     const int64_t n_kv = gguf_get_n_kv(ctx.get());
     for (int64_t i = 0; i < n_kv; ++i) {
@@ -2081,7 +2124,7 @@ void Model::load_weights_from_gguf(const std::string & path, BackendResolver res
         throw std::runtime_error("failed to open GGUF file for reading tensor data");
     }
 
-    const auto parameters = named_parameters(true);
+    const auto parameters = model_->named_parameters(true);
 
     Backend fallback_backend;
     const Backend * fallback_ptr = nullptr;
@@ -2195,23 +2238,61 @@ void Model::load_weights_from_gguf(const std::string & path, BackendResolver res
     }
 }
 
-Model::ExecutionBackends Model::prepare_execution_backends() const {
-    ExecutionBackends execution_backends;
+void Generator::prepare_execution_backends(GenerationWorkspace & workspace) const {
+    workspace.backends.clear();
+    workspace.buffer_types.clear();
+    workspace.buffer_to_index.clear();
+    workspace.cpu_index = 0;
 
-    Backend cpu_backend = Backend::cpu();
-    if (!cpu_backend.defined()) {
-        throw std::runtime_error("failed to initialise CPU backend for generation");
+    auto register_backend = [&](const Backend & backend) {
+        if (!backend.defined()) {
+            throw std::runtime_error("attempted to register an undefined backend for generation");
+        }
+
+        ggml_backend_buffer_type_t type = backend.default_buffer_type();
+        if (!type) {
+            throw std::runtime_error("provided backend does not expose a default buffer type");
+        }
+
+        if (workspace.buffer_to_index.find(type) != workspace.buffer_to_index.end()) {
+            return;
+        }
+
+        size_t index = workspace.backends.size();
+        workspace.buffer_to_index[type] = index;
+        workspace.buffer_types.push_back(type);
+        workspace.backends.emplace_back(backend.raw(), false);
+        if (ggml_backend_buft_get_device(type) == nullptr) {
+            workspace.cpu_index = index;
+        }
+    };
+
+    for (const auto & backend : provided_backends_) {
+        register_backend(backend);
     }
 
-    ggml_backend_buffer_type_t cpu_buffer_type = cpu_backend.default_buffer_type();
-    if (!cpu_buffer_type) {
-        throw std::runtime_error("CPU backend does not provide a default buffer type");
+    bool has_cpu = false;
+    for (const auto & entry : workspace.buffer_types) {
+        if (ggml_backend_buft_get_device(entry) == nullptr) {
+            has_cpu = true;
+            break;
+        }
     }
 
-    execution_backends.buffer_to_index[cpu_buffer_type] = execution_backends.backends.size();
-    execution_backends.buffer_types.push_back(cpu_buffer_type);
-    execution_backends.backends.push_back(std::move(cpu_backend));
-    execution_backends.cpu_index = 0;
+    if (!has_cpu) {
+        Backend cpu_backend = Backend::cpu();
+        if (!cpu_backend.defined()) {
+            throw std::runtime_error("failed to initialise CPU backend for generation");
+        }
+        ggml_backend_buffer_type_t cpu_buffer_type = cpu_backend.default_buffer_type();
+        if (!cpu_buffer_type) {
+            throw std::runtime_error("CPU backend does not provide a default buffer type");
+        }
+        workspace.buffer_to_index[cpu_buffer_type] = workspace.backends.size();
+        workspace.buffer_types.push_back(cpu_buffer_type);
+        workspace.cpu_index = workspace.backends.size();
+        workspace.backends.push_back(std::move(cpu_backend));
+    }
 
     for (const auto & buffer : parameter_buffers_) {
         ggml_backend_buffer_type_t type = buffer.type();
@@ -2219,13 +2300,13 @@ Model::ExecutionBackends Model::prepare_execution_backends() const {
             continue;
         }
 
-        if (execution_backends.buffer_to_index.find(type) != execution_backends.buffer_to_index.end()) {
+        if (workspace.buffer_to_index.find(type) != workspace.buffer_to_index.end()) {
             continue;
         }
 
         ggml_backend_dev_t device = ggml_backend_buft_get_device(type);
         if (device == nullptr) {
-            execution_backends.buffer_to_index[type] = execution_backends.cpu_index;
+            workspace.buffer_to_index[type] = workspace.cpu_index;
             continue;
         }
 
@@ -2235,24 +2316,22 @@ Model::ExecutionBackends Model::prepare_execution_backends() const {
         }
 
         Backend backend(handle, true);
-        execution_backends.buffer_to_index[type] = execution_backends.backends.size();
-        execution_backends.buffer_types.push_back(type);
-        execution_backends.backends.push_back(std::move(backend));
+        workspace.buffer_to_index[type] = workspace.backends.size();
+        workspace.buffer_types.push_back(type);
+        workspace.backends.push_back(std::move(backend));
     }
 
-    if (execution_backends.empty()) {
+    if (workspace.empty()) {
         throw std::runtime_error("no execution backend available for generation");
     }
-
-    return execution_backends;
 }
 
-void Model::collect_tensor_placements(const ExecutionBackends & execution_backends,
-                                      std::vector<std::pair<Tensor, size_t>> & placements) const {
+void Generator::collect_tensor_placements(const GenerationWorkspace & workspace,
+                                          std::vector<std::pair<Tensor, size_t>> & placements) const {
     placements.clear();
 
-    const auto params  = named_parameters(true);
-    const auto buffers = this->buffers(true);
+    const auto params  = model_->named_parameters(true);
+    const auto buffers = model_->buffers(true);
     placements.reserve(params.size() + buffers.size());
 
     auto record_tensor = [&](const Tensor & tensor) {
@@ -2264,8 +2343,8 @@ void Model::collect_tensor_placements(const ExecutionBackends & execution_backen
             return;
         }
         ggml_backend_buffer_type_t type = ggml_backend_buffer_get_type(raw->buffer);
-        auto it = execution_backends.buffer_to_index.find(type);
-        if (it == execution_backends.buffer_to_index.end()) {
+        auto it = workspace.buffer_to_index.find(type);
+        if (it == workspace.buffer_to_index.end()) {
             return;
         }
         placements.emplace_back(tensor, it->second);
@@ -2279,40 +2358,57 @@ void Model::collect_tensor_placements(const ExecutionBackends & execution_backen
     }
 }
 
-BackendScheduler Model::create_scheduler(const ExecutionBackends & execution_backends,
-                                         size_t graph_nodes) const {
-    if (execution_backends.empty()) {
+Generator::GenerationWorkspace & Generator::ensure_generation_workspace() const {
+    if (!generation_workspace_ready_) {
+        generation_workspace_.clear();
+        prepare_execution_backends(generation_workspace_);
+        collect_tensor_placements(generation_workspace_, generation_workspace_.cached_placements);
+        generation_workspace_.reserved_graph_nodes = 0;
+        generation_workspace_.max_graph_nodes      = 0;
+        generation_workspace_ready_               = true;
+    }
+    return generation_workspace_;
+}
+
+void Generator::invalidate_generation_workspace() {
+    generation_workspace_.clear();
+    generation_workspace_ready_ = false;
+}
+
+BackendScheduler Generator::create_scheduler(const GenerationWorkspace & workspace,
+                                             size_t graph_nodes) const {
+    if (workspace.empty()) {
         throw std::runtime_error("no execution backend available for generation");
     }
 
     const size_t graph_size = std::max<size_t>(graph_nodes + 16, size_t{16});
-    return BackendScheduler::create(execution_backends.backends,
-                                    execution_backends.buffer_types,
+    return BackendScheduler::create(workspace.backends,
+                                    workspace.buffer_types,
                                     graph_size,
                                     false,
                                     false);
 }
 
-void Model::assign_backends(BackendScheduler & scheduler,
-                            const ExecutionBackends & execution_backends,
-                            const std::vector<std::pair<Tensor, size_t>> & placements,
-                            const Tensor & input_tokens) const {
+void Generator::assign_backends(BackendScheduler & scheduler,
+                                const GenerationWorkspace & workspace,
+                                const std::vector<std::pair<Tensor, size_t>> & placements,
+                                const Tensor & input_tokens) const {
     for (const auto & placement : placements) {
         const size_t backend_index = placement.second;
-        if (backend_index >= execution_backends.backends.size()) {
+        if (backend_index >= workspace.backends.size()) {
             throw std::runtime_error("tensor placement references an unknown backend");
         }
-        scheduler.set_tensor_backend(placement.first, execution_backends.backends[backend_index]);
+        scheduler.set_tensor_backend(placement.first, workspace.backends[backend_index]);
     }
 
-    if (execution_backends.cpu_index >= execution_backends.backends.size()) {
+    if (workspace.cpu_index >= workspace.backends.size()) {
         throw std::runtime_error("CPU backend index is out of range");
     }
 
-    scheduler.set_tensor_backend(input_tokens, execution_backends.backends[execution_backends.cpu_index]);
+    scheduler.set_tensor_backend(input_tokens, workspace.backends[workspace.cpu_index]);
 }
 
-void Model::upload_prompt_tokens(const Tensor & input_tokens, const std::vector<int> & tokens) const {
+void Generator::upload_prompt_tokens(const Tensor & input_tokens, const std::vector<int> & tokens) const {
     if (!input_tokens.defined()) {
         throw std::invalid_argument("input tensor for prompt upload must be defined");
     }
@@ -2327,7 +2423,7 @@ void Model::upload_prompt_tokens(const Tensor & input_tokens, const std::vector<
     }
 }
 
-int Model::select_next_token(const Tensor & logits) const {
+int Generator::select_next_token(const Tensor & logits) const {
     if (logits.raw()->type != GGML_TYPE_F32) {
         throw std::invalid_argument("logits tensor must be in float32 format for token selection");
     }
@@ -2368,12 +2464,12 @@ int Model::select_next_token(const Tensor & logits) const {
     return static_cast<int>(std::distance(begin, max_it));
 }
 
-std::vector<int> Model::generate(std::vector<int> prompt, int n) {
+std::vector<int> Generator::generate(std::vector<int> prompt, int n) {
     if (n < 0) {
         throw std::invalid_argument("number of tokens to generate must be non-negative");
     }
 
-    auto shared_ctx = ctx();
+    auto shared_ctx = model_->ctx();
     if (!shared_ctx) {
         throw std::runtime_error("model context is not initialised");
     }
@@ -2386,9 +2482,12 @@ std::vector<int> Model::generate(std::vector<int> prompt, int n) {
         throw std::invalid_argument("prompt must contain at least one token");
     }
 
-    ExecutionBackends execution_backends = prepare_execution_backends();
-
-    std::vector<std::pair<Tensor, size_t>> placements;
+    GenerationWorkspace & workspace = ensure_generation_workspace();
+    BackendScheduler    & scheduler = workspace.scheduler;
+    std::vector<std::pair<Tensor, size_t>> & placements = workspace.cached_placements;
+    if (placements.empty()) {
+        collect_tensor_placements(workspace, placements);
+    }
 
     tokens.reserve(tokens.size() + static_cast<size_t>(n));
 
@@ -2396,7 +2495,7 @@ std::vector<int> Model::generate(std::vector<int> prompt, int n) {
         Tensor input_tokens = shared_ctx->new_tensor(GGML_TYPE_I32, {static_cast<int64_t>(tokens.size())});
         ggml_set_input(input_tokens.raw());
 
-        Tensor logits = forward(input_tokens);
+        Tensor logits = model_->forward(input_tokens);
         if (!logits.defined()) {
             throw std::runtime_error("model forward pass produced an undefined tensor");
         }
@@ -2415,14 +2514,36 @@ std::vector<int> Model::generate(std::vector<int> prompt, int n) {
 
         ggml_build_forward_expand(graph, logits.raw());
 
-        BackendScheduler scheduler = create_scheduler(execution_backends, ggml_graph_n_nodes(graph));
+        const size_t graph_nodes = static_cast<size_t>(ggml_graph_n_nodes(graph));
 
-        collect_tensor_placements(execution_backends, placements);
-        assign_backends(scheduler, execution_backends, placements, input_tokens);
-
-        if (!scheduler.reserve(graph)) {
-            throw std::runtime_error("failed to reserve backend resources for graph");
+        bool scheduler_created = false;
+        if (!scheduler.defined() || graph_nodes > workspace.max_graph_nodes) {
+            scheduler = create_scheduler(workspace, graph_nodes);
+            workspace.max_graph_nodes    = graph_nodes;
+            workspace.reserved_graph_nodes = 0;
+            scheduler_created = true;
+        } else {
+            scheduler.reset();
         }
+
+        auto assign_all = [&]() {
+            assign_backends(scheduler, workspace, placements, input_tokens);
+        };
+        assign_all();
+
+        const bool needs_reserve = scheduler_created || graph_nodes > workspace.reserved_graph_nodes;
+        if (needs_reserve) {
+            if (!scheduler.reserve(graph)) {
+                throw std::runtime_error("failed to reserve backend resources for graph");
+            }
+            workspace.reserved_graph_nodes = graph_nodes;
+            assign_all();
+        }
+
+        if (graph_nodes > workspace.max_graph_nodes) {
+            workspace.max_graph_nodes = graph_nodes;
+        }
+
         if (!scheduler.alloc_graph(graph)) {
             throw std::runtime_error("failed to allocate graph buffers on backends");
         }
