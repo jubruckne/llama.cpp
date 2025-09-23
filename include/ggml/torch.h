@@ -11,7 +11,9 @@
 #include <initializer_list>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -571,9 +573,9 @@ private:
     std::vector<std::pair<std::string, std::shared_ptr<Module>>> ordered_modules_;
 };
 
-class Model : public nn::Module {
-public:
-    using ConfigValue = std::variant<
+struct ConfigValue {
+    using Variant = std::variant<
+        std::monostate,
         int64_t,
         uint64_t,
         double,
@@ -587,29 +589,119 @@ public:
         std::vector<std::string>,
         std::vector<uint8_t>>;
 
-    using ConfigMap = std::map<std::string, ConfigValue>;
+    ConfigValue() = default;
+
+    template <typename T,
+              typename Decayed = std::decay_t<T>,
+              typename = std::enable_if_t<!std::is_same_v<Decayed, ConfigValue>>>
+    ConfigValue(T && value)
+        : value_(std::forward<T>(value)) {
+    }
+
+    ConfigValue(const ConfigValue &) = default;
+    ConfigValue(ConfigValue &&) noexcept = default;
+    ConfigValue & operator=(const ConfigValue &) = default;
+    ConfigValue & operator=(ConfigValue &&) noexcept = default;
+
+    template <typename T,
+              typename Decayed = std::decay_t<T>,
+              typename = std::enable_if_t<!std::is_same_v<Decayed, ConfigValue>>>
+    ConfigValue & operator=(T && value) {
+        value_ = std::forward<T>(value);
+        return *this;
+    }
+
+    bool has_value() const {
+        return !std::holds_alternative<std::monostate>(value_);
+    }
+
+    void reset() {
+        value_.template emplace<std::monostate>();
+    }
+
+    template <typename T>
+    bool is() const {
+        return std::holds_alternative<T>(value_);
+    }
+
+    template <typename T>
+    T & get() {
+        return std::get<T>(value_);
+    }
+
+    template <typename T>
+    const T & get() const {
+        return std::get<T>(value_);
+    }
+
+    Variant & variant() { return value_; }
+    const Variant & variant() const { return value_; }
+
+private:
+    Variant value_;
+};
+
+class Model : public nn::Module {
+public:
+    using ConfigValue = ggml::torch::ConfigValue;
+    struct Config : public std::map<std::string, ConfigValue> {
+        using Base = std::map<std::string, ConfigValue>;
+        using Base::Base;
+
+        Config() = default;
+        Config(const Config &) = default;
+        Config(Config &&) noexcept = default;
+        Config & operator=(const Config &) = default;
+        Config & operator=(Config &&) noexcept = default;
+        virtual ~Config() = default;
+
+        bool contains(const std::string & key) const {
+            return this->find(key) != this->end();
+        }
+
+        template <typename T>
+        bool is(const std::string & key) const {
+            auto it = this->find(key);
+            if (it == this->end()) {
+                return false;
+            }
+            return it->second.template is<T>();
+        }
+
+        template <typename T>
+        T & get(const std::string & key) {
+            return this->at(key).template get<T>();
+        }
+
+        template <typename T>
+        const T & get(const std::string & key) const {
+            return this->at(key).template get<T>();
+        }
+    };
+
+    using ConfigMap = Config;
 
     explicit Model(std::shared_ptr<Context> context);
 
+    ConfigMap       & config() { return config_; }
+    const ConfigMap & config() const { return config_; }
+    void set_config(ConfigMap config) { config_ = std::move(config); }
+    void clear_config() { config_.clear(); }
+
     Model(Model &&) noexcept = default;
     Model & operator=(Model &&) noexcept = default;
+
+protected:
+    ConfigMap config_{};
 };
+
+class Loader;
 
 class Generator {
 public:
     using ConfigMap       = Model::ConfigMap;
     using ConfigValue     = Model::ConfigValue;
-    using BackendResolver = std::function<const Backend *(const std::string &, const Tensor &)>;
-
-    static Generator create(std::shared_ptr<Model> model,
-                            const std::string & gguf_path,
-                            std::vector<Backend *> backends = {},
-                            BackendResolver resolver = BackendResolver());
-
-    static Generator create(Model & model,
-                            const std::string & gguf_path,
-                            std::vector<Backend *> backends = {},
-                            BackendResolver resolver = BackendResolver());
+    using BackendResolver = std::function<Backend &(const std::string &, const Tensor &)>;
 
     Generator(const Generator &) = delete;
     Generator & operator=(const Generator &) = delete;
@@ -617,16 +709,16 @@ public:
     Generator(Generator &&) noexcept = default;
     Generator & operator=(Generator &&) noexcept = default;
 
-    const ConfigMap & config() const { return config_; }
+    const ConfigMap & config() const { return model_->config(); }
     Model       & model() { return *model_; }
     const Model & model() const { return *model_; }
 
     std::vector<int> generate(std::vector<int> prompt, int n);
 
 private:
-    Generator(std::shared_ptr<Model> model, std::vector<Backend> provided_backends);
+    Generator(std::shared_ptr<Model> model, std::vector<BackendBuffer> parameter_buffers);
 
-    void load_weights_from_gguf(const std::string & path, BackendResolver resolver);
+    friend class Loader;
 
     struct GenerationWorkspace {
         GenerationWorkspace() = default;
@@ -666,11 +758,57 @@ private:
     void invalidate_generation_workspace();
 
     std::shared_ptr<Model> model_;
-    ConfigMap config_;
     std::vector<BackendBuffer> parameter_buffers_;
-    std::vector<Backend> provided_backends_;
     mutable GenerationWorkspace generation_workspace_;
     mutable bool generation_workspace_ready_ = false;
+};
+
+class Loader {
+public:
+    using BackendResolver = Generator::BackendResolver;
+
+    template <typename TModel>
+    static std::pair<std::shared_ptr<TModel>, Generator>
+    load_from_gguf(const std::string & gguf_path, Backend & backend) {
+        BackendResolver resolver = [&backend](const std::string &, const Tensor &) -> Backend & {
+            return backend;
+        };
+        return load_from_gguf_with_resolver<TModel>(gguf_path, std::move(resolver));
+    }
+
+    template <typename TModel>
+    static std::pair<std::shared_ptr<TModel>, Generator>
+    load_from_gguf(const std::string & gguf_path, BackendResolver resolver) {
+        return load_from_gguf_with_resolver<TModel>(gguf_path, std::move(resolver));
+    }
+
+private:
+    static std::shared_ptr<Context> create_context_for_file(const std::string & gguf_path);
+    static struct ggml_init_params default_context_params_from_file(const std::string & gguf_path);
+
+    static void load_config_from_gguf(Model & model, const std::string & gguf_path);
+    static std::vector<BackendBuffer>
+    load_weights_from_gguf(Model & model, const std::string & gguf_path, BackendResolver & resolver);
+
+    template <typename TModel>
+    static std::pair<std::shared_ptr<TModel>, Generator>
+    load_from_gguf_with_resolver(const std::string & gguf_path, BackendResolver resolver) {
+        static_assert(std::is_base_of_v<Model, TModel>,
+                      "Loader::load_from_gguf requires TModel to derive from ggml::torch::Model");
+
+        if (!resolver) {
+            throw std::invalid_argument("Loader::load_from_gguf requires a backend resolver");
+        }
+
+        auto context = create_context_for_file(gguf_path);
+        auto model   = std::make_shared<TModel>(std::move(context));
+
+        std::shared_ptr<Model> base_model = model;
+        load_config_from_gguf(*base_model, gguf_path);
+        auto parameter_buffers = load_weights_from_gguf(*base_model, gguf_path, resolver);
+        Generator generator(base_model, std::move(parameter_buffers));
+        return {std::move(model), std::move(generator)};
+    }
 };
 
 } // namespace ggml::torch

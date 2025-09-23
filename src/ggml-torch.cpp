@@ -7,9 +7,10 @@
 
 #include <algorithm>
 #include <array>
-#include <fstream>
 #include <cmath>
+#include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -1957,285 +1958,13 @@ Model::Model(std::shared_ptr<Context> context)
     : nn::Module(std::move(context)) {
 }
 
-Generator::Generator(std::shared_ptr<Model> model, std::vector<Backend> provided_backends)
+Generator::Generator(std::shared_ptr<Model> model, std::vector<BackendBuffer> parameter_buffers)
     : model_(std::move(model)),
-      provided_backends_(std::move(provided_backends)) {
+      parameter_buffers_(std::move(parameter_buffers)) {
     if (!model_) {
         throw std::invalid_argument("Generator requires a valid model instance");
     }
-}
-
-Generator Generator::create(std::shared_ptr<Model> model,
-                            const std::string & path,
-                            std::vector<Backend *> backends,
-                            BackendResolver resolver) {
-    if (!model) {
-        throw std::invalid_argument("Generator::create requires a non-null model");
-    }
-
-    std::vector<Backend> provided;
-    provided.reserve(backends.size());
-    for (Backend * backend_ptr : backends) {
-        if (backend_ptr == nullptr) {
-            throw std::invalid_argument("Generator::create received a null backend pointer");
-        }
-        if (!backend_ptr->defined()) {
-            throw std::invalid_argument("Generator::create received an undefined backend");
-        }
-        provided.emplace_back(backend_ptr->raw(), false);
-    }
-
-    Generator generator(std::move(model), std::move(provided));
-    generator.load_weights_from_gguf(path, std::move(resolver));
-    return generator;
-}
-
-Generator Generator::create(Model & model,
-                            const std::string & path,
-                            std::vector<Backend *> backends,
-                            BackendResolver resolver) {
-    std::shared_ptr<nn::Module> base;
-    try {
-        base = model.shared_from_this();
-    } catch (const std::bad_weak_ptr &) {
-        throw std::runtime_error("Generator::create requires the model to be managed by std::shared_ptr");
-    }
-    auto shared_model = std::static_pointer_cast<Model>(base);
-    return create(std::move(shared_model), path, std::move(backends), std::move(resolver));
-}
-
-void Generator::load_weights_from_gguf(const std::string & path, BackendResolver resolver) {
-    struct gguf_init_params params {
-        /*.no_alloc =*/ true,
-        /*.ctx      =*/ nullptr,
-    };
-
-    std::unique_ptr<gguf_context, decltype(&gguf_free)> ctx(gguf_init_from_file(path.c_str(), params), gguf_free);
-    if (!ctx) {
-        throw std::runtime_error("failed to open GGUF file for weight loading");
-    }
-
-    config_.clear();
-    parameter_buffers_.clear();
     invalidate_generation_workspace();
-
-    const int64_t n_kv = gguf_get_n_kv(ctx.get());
-    for (int64_t i = 0; i < n_kv; ++i) {
-        const std::string key = gguf_get_key(ctx.get(), i);
-        switch (gguf_get_kv_type(ctx.get(), i)) {
-            case GGUF_TYPE_UINT8:
-                config_[key] = static_cast<uint64_t>(gguf_get_val_u8(ctx.get(), i));
-                break;
-            case GGUF_TYPE_INT8:
-                config_[key] = static_cast<int64_t>(gguf_get_val_i8(ctx.get(), i));
-                break;
-            case GGUF_TYPE_UINT16:
-                config_[key] = static_cast<uint64_t>(gguf_get_val_u16(ctx.get(), i));
-                break;
-            case GGUF_TYPE_INT16:
-                config_[key] = static_cast<int64_t>(gguf_get_val_i16(ctx.get(), i));
-                break;
-            case GGUF_TYPE_UINT32:
-                config_[key] = static_cast<uint64_t>(gguf_get_val_u32(ctx.get(), i));
-                break;
-            case GGUF_TYPE_INT32:
-                config_[key] = static_cast<int64_t>(gguf_get_val_i32(ctx.get(), i));
-                break;
-            case GGUF_TYPE_FLOAT32:
-                config_[key] = static_cast<double>(gguf_get_val_f32(ctx.get(), i));
-                break;
-            case GGUF_TYPE_BOOL:
-                config_[key] = gguf_get_val_bool(ctx.get(), i);
-                break;
-            case GGUF_TYPE_STRING:
-                config_[key] = std::string(gguf_get_val_str(ctx.get(), i));
-                break;
-            case GGUF_TYPE_UINT64:
-                config_[key] = gguf_get_val_u64(ctx.get(), i);
-                break;
-            case GGUF_TYPE_INT64:
-                config_[key] = gguf_get_val_i64(ctx.get(), i);
-                break;
-            case GGUF_TYPE_FLOAT64:
-                config_[key] = gguf_get_val_f64(ctx.get(), i);
-                break;
-            case GGUF_TYPE_ARRAY: {
-                const size_t count = gguf_get_arr_n(ctx.get(), i);
-                const gguf_type elem_type = gguf_get_arr_type(ctx.get(), i);
-                switch (elem_type) {
-                    case GGUF_TYPE_UINT8: {
-                        const auto * data = static_cast<const uint8_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config_[key] = std::vector<uint8_t>(data, data + count);
-                    } break;
-                    case GGUF_TYPE_INT8: {
-                        const auto * data = static_cast<const int8_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config_[key] = convert_numeric_array<int64_t>(data, count);
-                    } break;
-                    case GGUF_TYPE_UINT16: {
-                        const auto * data = static_cast<const uint16_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config_[key] = convert_numeric_array<uint64_t>(data, count);
-                    } break;
-                    case GGUF_TYPE_INT16: {
-                        const auto * data = static_cast<const int16_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config_[key] = convert_numeric_array<int64_t>(data, count);
-                    } break;
-                    case GGUF_TYPE_UINT32: {
-                        const auto * data = static_cast<const uint32_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config_[key] = convert_numeric_array<uint64_t>(data, count);
-                    } break;
-                    case GGUF_TYPE_INT32: {
-                        const auto * data = static_cast<const int32_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config_[key] = convert_numeric_array<int64_t>(data, count);
-                    } break;
-                    case GGUF_TYPE_UINT64: {
-                        const auto * data = static_cast<const uint64_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config_[key] = std::vector<uint64_t>(data, data + count);
-                    } break;
-                    case GGUF_TYPE_INT64: {
-                        const auto * data = static_cast<const int64_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config_[key] = std::vector<int64_t>(data, data + count);
-                    } break;
-                    case GGUF_TYPE_FLOAT32: {
-                        const auto * data = static_cast<const float *>(gguf_get_arr_data(ctx.get(), i));
-                        config_[key] = std::vector<float>(data, data + count);
-                    } break;
-                    case GGUF_TYPE_FLOAT64: {
-                        const auto * data = static_cast<const double *>(gguf_get_arr_data(ctx.get(), i));
-                        config_[key] = std::vector<double>(data, data + count);
-                    } break;
-                    case GGUF_TYPE_BOOL: {
-                        const auto * data = static_cast<const int8_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config_[key] = convert_bool_array(data, count);
-                    } break;
-                    case GGUF_TYPE_STRING:
-                        config_[key] = convert_string_array(ctx.get(), i, count);
-                        break;
-                    default:
-                        throw std::runtime_error("unsupported GGUF array type in configuration");
-                }
-            } break;
-            default:
-                throw std::runtime_error("unsupported GGUF value type in configuration");
-        }
-    }
-
-    std::ifstream stream(path, std::ios::binary);
-    if (!stream) {
-        throw std::runtime_error("failed to open GGUF file for reading tensor data");
-    }
-
-    const auto parameters = model_->named_parameters(true);
-
-    Backend fallback_backend;
-    const Backend * fallback_ptr = nullptr;
-    if (!resolver) {
-        fallback_backend = Backend::cpu();
-        if (!fallback_backend.defined()) {
-            throw std::runtime_error("failed to create CPU backend for weight allocation");
-        }
-        fallback_ptr = &fallback_backend;
-    }
-
-    std::unordered_map<const Backend *, std::vector<Tensor>> allocations;
-    allocations.reserve(parameters.size());
-
-    for (const auto & entry : parameters) {
-        const auto & name = entry.first;
-        const auto & tensor = entry.second;
-        if (!tensor.defined()) {
-            throw std::runtime_error("encountered undefined parameter while loading weights");
-        }
-
-        ggml_tensor * raw = tensor.raw();
-        if (raw == nullptr) {
-            throw std::runtime_error("encountered parameter without underlying ggml tensor");
-        }
-        if (raw->view_src != nullptr) {
-            continue;
-        }
-
-        const Backend * backend_ptr = nullptr;
-        if (resolver) {
-            backend_ptr = resolver(name, tensor);
-        }
-        if (!backend_ptr) {
-            backend_ptr = fallback_ptr;
-        }
-
-        if (raw->buffer == nullptr) {
-            if (!backend_ptr) {
-                throw std::runtime_error("no backend available to allocate parameter buffer");
-            }
-            allocations[backend_ptr].push_back(tensor);
-        }
-    }
-
-    for (auto & alloc : allocations) {
-        const Backend * backend = alloc.first;
-        if (!backend || !backend->defined()) {
-            throw std::runtime_error("attempted to allocate parameters on an undefined backend");
-        }
-        BackendBuffer buffer = backend->alloc_tensors(alloc.second, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        buffer.set_usage(GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        for (const auto & tensor : alloc.second) {
-            tensor.assign_buffer(buffer);
-        }
-        parameter_buffers_.push_back(std::move(buffer));
-    }
-
-    const size_t data_offset = gguf_get_data_offset(ctx.get());
-    std::vector<char> buffer;
-
-    for (const auto & entry : parameters) {
-        const auto & name = entry.first;
-        const auto & tensor = entry.second;
-        if (!tensor.defined()) {
-            throw std::runtime_error("encountered undefined parameter while uploading weights");
-        }
-        ggml_tensor * raw = tensor.raw();
-        if (raw->view_src != nullptr) {
-            continue;
-        }
-        if (raw->buffer == nullptr) {
-            throw std::runtime_error("parameter '" + name + "' does not have an allocated backend buffer");
-        }
-
-        const int64_t tensor_index = gguf_find_tensor(ctx.get(), name.c_str());
-        if (tensor_index < 0) {
-            throw std::runtime_error("tensor '" + name + "' not found in GGUF file");
-        }
-
-        const size_t tensor_size = gguf_get_tensor_size(ctx.get(), tensor_index);
-        const size_t expected_size = ggml_nbytes(raw);
-        if (tensor_size != expected_size) {
-            throw std::runtime_error("size mismatch while loading tensor '" + name + "'");
-        }
-
-        const enum ggml_type tensor_type = gguf_get_tensor_type(ctx.get(), tensor_index);
-        if (tensor_type != raw->type) {
-            throw std::runtime_error("type mismatch while loading tensor '" + name + "'");
-        }
-
-        const size_t tensor_offset = data_offset + gguf_get_tensor_offset(ctx.get(), tensor_index);
-
-        buffer.resize(tensor_size);
-        stream.clear();
-        stream.seekg(static_cast<std::streamoff>(tensor_offset), std::ios::beg);
-        if (!stream.good()) {
-            throw std::runtime_error("failed to seek to tensor data for '" + name + "'");
-        }
-        if (tensor_size > 0) {
-            stream.read(buffer.data(), static_cast<std::streamsize>(tensor_size));
-            if (stream.gcount() != static_cast<std::streamsize>(tensor_size)) {
-                throw std::runtime_error("failed to read tensor data for '" + name + "'");
-            }
-        }
-
-        ggml_backend_buffer_set_usage(raw->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        if (tensor_size > 0) {
-            ggml_backend_tensor_set(raw, buffer.data(), 0, tensor_size);
-        }
-    }
 }
 
 void Generator::prepare_execution_backends(GenerationWorkspace & workspace) const {
@@ -2244,55 +1973,18 @@ void Generator::prepare_execution_backends(GenerationWorkspace & workspace) cons
     workspace.buffer_to_index.clear();
     workspace.cpu_index = 0;
 
-    auto register_backend = [&](const Backend & backend) {
-        if (!backend.defined()) {
-            throw std::runtime_error("attempted to register an undefined backend for generation");
-        }
-
-        ggml_backend_buffer_type_t type = backend.default_buffer_type();
-        if (!type) {
-            throw std::runtime_error("provided backend does not expose a default buffer type");
-        }
-
-        if (workspace.buffer_to_index.find(type) != workspace.buffer_to_index.end()) {
-            return;
-        }
-
-        size_t index = workspace.backends.size();
-        workspace.buffer_to_index[type] = index;
-        workspace.buffer_types.push_back(type);
-        workspace.backends.emplace_back(backend.raw(), false);
-        if (ggml_backend_buft_get_device(type) == nullptr) {
-            workspace.cpu_index = index;
-        }
-    };
-
-    for (const auto & backend : provided_backends_) {
-        register_backend(backend);
+    Backend cpu_backend = Backend::cpu();
+    if (!cpu_backend.defined()) {
+        throw std::runtime_error("failed to initialise CPU backend for generation");
     }
-
-    bool has_cpu = false;
-    for (const auto & entry : workspace.buffer_types) {
-        if (ggml_backend_buft_get_device(entry) == nullptr) {
-            has_cpu = true;
-            break;
-        }
+    ggml_backend_buffer_type_t cpu_buffer_type = cpu_backend.default_buffer_type();
+    if (!cpu_buffer_type) {
+        throw std::runtime_error("CPU backend does not provide a default buffer type");
     }
-
-    if (!has_cpu) {
-        Backend cpu_backend = Backend::cpu();
-        if (!cpu_backend.defined()) {
-            throw std::runtime_error("failed to initialise CPU backend for generation");
-        }
-        ggml_backend_buffer_type_t cpu_buffer_type = cpu_backend.default_buffer_type();
-        if (!cpu_buffer_type) {
-            throw std::runtime_error("CPU backend does not provide a default buffer type");
-        }
-        workspace.buffer_to_index[cpu_buffer_type] = workspace.backends.size();
-        workspace.buffer_types.push_back(cpu_buffer_type);
-        workspace.cpu_index = workspace.backends.size();
-        workspace.backends.push_back(std::move(cpu_backend));
-    }
+    workspace.cpu_index = workspace.backends.size();
+    workspace.buffer_to_index[cpu_buffer_type] = workspace.cpu_index;
+    workspace.buffer_types.push_back(cpu_buffer_type);
+    workspace.backends.push_back(std::move(cpu_backend));
 
     for (const auto & buffer : parameter_buffers_) {
         ggml_backend_buffer_type_t type = buffer.type();
@@ -2561,6 +2253,289 @@ std::vector<int> Generator::generate(std::vector<int> prompt, int n) {
     }
 
     return tokens;
+}
+
+
+void Loader::load_config_from_gguf(Model & model, const std::string & path) {
+    struct gguf_init_params params {
+        /*.no_alloc =*/ true,
+        /*.ctx      =*/ nullptr,
+    };
+
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> ctx(gguf_init_from_file(path.c_str(), params), gguf_free);
+    if (!ctx) {
+        throw std::runtime_error("failed to open GGUF file for configuration loading");
+    }
+
+    auto & config = model.config();
+    config.clear();
+
+    const int64_t n_kv = gguf_get_n_kv(ctx.get());
+    for (int64_t i = 0; i < n_kv; ++i) {
+        const std::string key = gguf_get_key(ctx.get(), i);
+        switch (gguf_get_kv_type(ctx.get(), i)) {
+            case GGUF_TYPE_UINT8:
+                config[key] = static_cast<uint64_t>(gguf_get_val_u8(ctx.get(), i));
+                break;
+            case GGUF_TYPE_INT8:
+                config[key] = static_cast<int64_t>(gguf_get_val_i8(ctx.get(), i));
+                break;
+            case GGUF_TYPE_UINT16:
+                config[key] = static_cast<uint64_t>(gguf_get_val_u16(ctx.get(), i));
+                break;
+            case GGUF_TYPE_INT16:
+                config[key] = static_cast<int64_t>(gguf_get_val_i16(ctx.get(), i));
+                break;
+            case GGUF_TYPE_UINT32:
+                config[key] = static_cast<uint64_t>(gguf_get_val_u32(ctx.get(), i));
+                break;
+            case GGUF_TYPE_INT32:
+                config[key] = static_cast<int64_t>(gguf_get_val_i32(ctx.get(), i));
+                break;
+            case GGUF_TYPE_FLOAT32:
+                config[key] = static_cast<double>(gguf_get_val_f32(ctx.get(), i));
+                break;
+            case GGUF_TYPE_BOOL:
+                config[key] = gguf_get_val_bool(ctx.get(), i);
+                break;
+            case GGUF_TYPE_STRING:
+                config[key] = std::string(gguf_get_val_str(ctx.get(), i));
+                break;
+            case GGUF_TYPE_UINT64:
+                config[key] = gguf_get_val_u64(ctx.get(), i);
+                break;
+            case GGUF_TYPE_INT64:
+                config[key] = gguf_get_val_i64(ctx.get(), i);
+                break;
+            case GGUF_TYPE_FLOAT64:
+                config[key] = gguf_get_val_f64(ctx.get(), i);
+                break;
+            case GGUF_TYPE_ARRAY: {
+                const size_t count = gguf_get_arr_n(ctx.get(), i);
+                const gguf_type elem_type = gguf_get_arr_type(ctx.get(), i);
+                switch (elem_type) {
+                    case GGUF_TYPE_UINT8: {
+                        const auto * data = static_cast<const uint8_t *>(gguf_get_arr_data(ctx.get(), i));
+                        config[key] = std::vector<uint8_t>(data, data + count);
+                    } break;
+                    case GGUF_TYPE_INT8: {
+                        const auto * data = static_cast<const int8_t *>(gguf_get_arr_data(ctx.get(), i));
+                        config[key] = convert_numeric_array<int64_t>(data, count);
+                    } break;
+                    case GGUF_TYPE_UINT16: {
+                        const auto * data = static_cast<const uint16_t *>(gguf_get_arr_data(ctx.get(), i));
+                        config[key] = convert_numeric_array<uint64_t>(data, count);
+                    } break;
+                    case GGUF_TYPE_INT16: {
+                        const auto * data = static_cast<const int16_t *>(gguf_get_arr_data(ctx.get(), i));
+                        config[key] = convert_numeric_array<int64_t>(data, count);
+                    } break;
+                    case GGUF_TYPE_UINT32: {
+                        const auto * data = static_cast<const uint32_t *>(gguf_get_arr_data(ctx.get(), i));
+                        config[key] = convert_numeric_array<uint64_t>(data, count);
+                    } break;
+                    case GGUF_TYPE_INT32: {
+                        const auto * data = static_cast<const int32_t *>(gguf_get_arr_data(ctx.get(), i));
+                        config[key] = convert_numeric_array<int64_t>(data, count);
+                    } break;
+                    case GGUF_TYPE_UINT64: {
+                        const auto * data = static_cast<const uint64_t *>(gguf_get_arr_data(ctx.get(), i));
+                        config[key] = std::vector<uint64_t>(data, data + count);
+                    } break;
+                    case GGUF_TYPE_INT64: {
+                        const auto * data = static_cast<const int64_t *>(gguf_get_arr_data(ctx.get(), i));
+                        config[key] = std::vector<int64_t>(data, data + count);
+                    } break;
+                    case GGUF_TYPE_FLOAT32: {
+                        const auto * data = static_cast<const float *>(gguf_get_arr_data(ctx.get(), i));
+                        config[key] = std::vector<float>(data, data + count);
+                    } break;
+                    case GGUF_TYPE_FLOAT64: {
+                        const auto * data = static_cast<const double *>(gguf_get_arr_data(ctx.get(), i));
+                        config[key] = std::vector<double>(data, data + count);
+                    } break;
+                    case GGUF_TYPE_BOOL: {
+                        const auto * data = static_cast<const int8_t *>(gguf_get_arr_data(ctx.get(), i));
+                        config[key] = convert_bool_array(data, count);
+                    } break;
+                    case GGUF_TYPE_STRING:
+                        config[key] = convert_string_array(ctx.get(), i, count);
+                        break;
+                    default:
+                        throw std::runtime_error("unsupported GGUF array type in configuration");
+                }
+            } break;
+            default:
+                throw std::runtime_error("unsupported GGUF value type in configuration");
+        }
+    }
+}
+
+std::vector<BackendBuffer> Loader::load_weights_from_gguf(Model & model,
+                                                          const std::string & path,
+                                                          BackendResolver & resolver) {
+    if (!resolver) {
+        throw std::invalid_argument("Loader::load_weights_from_gguf requires a backend resolver");
+    }
+
+    struct gguf_init_params params {
+        /*.no_alloc =*/ true,
+        /*.ctx      =*/ nullptr,
+    };
+
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> ctx(gguf_init_from_file(path.c_str(), params), gguf_free);
+    if (!ctx) {
+        throw std::runtime_error("failed to open GGUF file for weight loading");
+    }
+
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        throw std::runtime_error("failed to open GGUF file for reading tensor data");
+    }
+
+    const auto parameters = model.named_parameters(true);
+
+    std::unordered_map<Backend *, std::vector<Tensor>> allocations;
+    allocations.reserve(parameters.size());
+
+    for (const auto & entry : parameters) {
+        const auto & name = entry.first;
+        const auto & tensor = entry.second;
+        if (!tensor.defined()) {
+            throw std::runtime_error("encountered undefined parameter while loading weights");
+        }
+
+        ggml_tensor * raw = tensor.raw();
+        if (raw == nullptr) {
+            throw std::runtime_error("encountered parameter without underlying ggml tensor");
+        }
+        if (raw->view_src != nullptr) {
+            continue;
+        }
+
+        Backend & backend = resolver(name, tensor);
+        if (!backend.defined()) {
+            throw std::runtime_error("resolver returned an undefined backend for parameter allocation");
+        }
+
+        if (raw->buffer == nullptr) {
+            allocations[&backend].push_back(tensor);
+        }
+    }
+
+    std::vector<BackendBuffer> parameter_buffers;
+    parameter_buffers.reserve(allocations.size());
+
+    for (auto & alloc : allocations) {
+        Backend * backend = alloc.first;
+        if (!backend || !backend->defined()) {
+            throw std::runtime_error("attempted to allocate parameters on an undefined backend");
+        }
+
+        BackendBuffer buffer = backend->alloc_tensors(alloc.second, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        buffer.set_usage(GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        for (const auto & tensor : alloc.second) {
+            tensor.assign_buffer(buffer);
+        }
+
+        parameter_buffers.push_back(std::move(buffer));
+    }
+
+    const size_t data_offset = gguf_get_data_offset(ctx.get());
+    std::vector<char> buffer;
+
+    for (const auto & entry : parameters) {
+        const auto & name = entry.first;
+        const auto & tensor = entry.second;
+        if (!tensor.defined()) {
+            throw std::runtime_error("encountered undefined parameter while uploading weights");
+        }
+
+        ggml_tensor * raw = tensor.raw();
+        if (raw->view_src != nullptr) {
+            continue;
+        }
+        if (raw->buffer == nullptr) {
+            throw std::runtime_error("parameter '" + name + "' does not have an allocated backend buffer");
+        }
+
+        const int64_t tensor_index = gguf_find_tensor(ctx.get(), name.c_str());
+        if (tensor_index < 0) {
+            throw std::runtime_error("tensor '" + name + "' not found in GGUF file");
+        }
+
+        const size_t tensor_size = gguf_get_tensor_size(ctx.get(), tensor_index);
+        const size_t expected_size = ggml_nbytes(raw);
+        if (tensor_size != expected_size) {
+            throw std::runtime_error("size mismatch while loading tensor '" + name + "'");
+        }
+
+        const enum ggml_type tensor_type = gguf_get_tensor_type(ctx.get(), tensor_index);
+        if (tensor_type != raw->type) {
+            throw std::runtime_error("type mismatch while loading tensor '" + name + "'");
+        }
+
+        const size_t tensor_offset = data_offset + gguf_get_tensor_offset(ctx.get(), tensor_index);
+
+        buffer.resize(tensor_size);
+        if (!stream.seekg(static_cast<std::streamoff>(tensor_offset), std::ios::beg)) {
+            throw std::runtime_error("failed to seek to tensor data in GGUF file");
+        }
+        if (!stream.read(buffer.data(), static_cast<std::streamsize>(tensor_size))) {
+            throw std::runtime_error("failed to read tensor data from GGUF file");
+        }
+
+        ggml_backend_tensor_set(raw, buffer.data(), 0, buffer.size());
+    }
+
+    return parameter_buffers;
+}
+
+std::shared_ptr<Context> Loader::create_context_for_file(const std::string & gguf_path) {
+    ggml_init_params params = default_context_params_from_file(gguf_path);
+    return Context::create(params);
+}
+
+struct ggml_init_params Loader::default_context_params_from_file(const std::string & gguf_path) {
+    struct gguf_init_params params {
+        /*.no_alloc =*/ true,
+        /*.ctx      =*/ nullptr,
+    };
+
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> ctx(gguf_init_from_file(gguf_path.c_str(), params), gguf_free);
+    if (!ctx) {
+        throw std::runtime_error("failed to open GGUF file for model loading");
+    }
+
+    const int64_t tensor_count_raw = gguf_get_n_tensors(ctx.get());
+    if (tensor_count_raw < 0) {
+        throw std::runtime_error("GGUF file reported a negative tensor count");
+    }
+
+    const size_t tensor_count = static_cast<size_t>(tensor_count_raw);
+    constexpr size_t extra_tensors = 64;
+    const size_t graph_nodes = std::max<size_t>(GGML_DEFAULT_GRAPH_SIZE, tensor_count);
+
+    size_t total_tensors = tensor_count;
+    total_tensors += graph_nodes;
+    total_tensors += extra_tensors;
+
+    const size_t tensor_overhead = ggml_tensor_overhead();
+    if (tensor_overhead != 0 && total_tensors > std::numeric_limits<size_t>::max() / tensor_overhead) {
+        throw std::runtime_error("tensor metadata allocation exceeds size limits");
+    }
+
+    size_t metadata_bytes = tensor_overhead * total_tensors;
+    size_t graph_bytes    = ggml_graph_overhead_custom(graph_nodes, false);
+    if (graph_bytes > std::numeric_limits<size_t>::max() - metadata_bytes) {
+        throw std::runtime_error("graph metadata allocation exceeds size limits");
+    }
+
+    ggml_init_params init{};
+    init.mem_size   = metadata_bytes + graph_bytes;
+    init.mem_buffer = nullptr;
+    init.no_alloc   = true;
+    return init;
 }
 
 } // namespace ggml::torch
