@@ -1,4 +1,4 @@
-#include "ggml/torch.h"
+#include "torch.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
