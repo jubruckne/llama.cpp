@@ -13,8 +13,10 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -573,51 +575,49 @@ private:
     std::vector<std::pair<std::string, std::shared_ptr<Module>>> ordered_modules_;
 };
 
-struct ConfigValue {
+struct Value {
     using Variant = std::variant<
-        std::monostate,
+        int8_t,
+        int16_t,
+        int32_t,
         int64_t,
+        uint8_t,
+        uint16_t,
+        uint32_t,
         uint64_t,
+        float,
         double,
         bool,
         std::string,
+        std::vector<int8_t>,
+        std::vector<int16_t>,
+        std::vector<int32_t>,
         std::vector<int64_t>,
+        std::vector<uint8_t>,
+        std::vector<uint16_t>,
+        std::vector<uint32_t>,
         std::vector<uint64_t>,
-        std::vector<double>,
         std::vector<float>,
+        std::vector<double>,
         std::vector<bool>,
-        std::vector<std::string>,
-        std::vector<uint8_t>>;
+        std::vector<std::string>>;
 
-    ConfigValue() = default;
+    Value() = delete;
 
-    template <typename T,
-              typename Decayed = std::decay_t<T>,
-              typename = std::enable_if_t<!std::is_same_v<Decayed, ConfigValue>>>
-    ConfigValue(T && value)
-        : value_(std::forward<T>(value)) {
+    template <typename Key,
+              typename T,
+              typename DecayedKey   = std::decay_t<Key>,
+              typename DecayedValue = std::decay_t<T>,
+              typename = std::enable_if_t<!std::is_same_v<DecayedValue, Value> &&
+                                          std::is_constructible_v<std::string, DecayedKey>>>
+    Value(Key && key, T && value)
+        : value_(std::forward<T>(value)), key_(std::forward<Key>(key)) {
     }
 
-    ConfigValue(const ConfigValue &) = default;
-    ConfigValue(ConfigValue &&) noexcept = default;
-    ConfigValue & operator=(const ConfigValue &) = default;
-    ConfigValue & operator=(ConfigValue &&) noexcept = default;
-
-    template <typename T,
-              typename Decayed = std::decay_t<T>,
-              typename = std::enable_if_t<!std::is_same_v<Decayed, ConfigValue>>>
-    ConfigValue & operator=(T && value) {
-        value_ = std::forward<T>(value);
-        return *this;
-    }
-
-    bool has_value() const {
-        return !std::holds_alternative<std::monostate>(value_);
-    }
-
-    void reset() {
-        value_.template emplace<std::monostate>();
-    }
+    Value(const Value &) = default;
+    Value(Value &&) noexcept = default;
+    Value & operator=(const Value &) = delete;
+    Value & operator=(Value &&) noexcept = delete;
 
     template <typename T>
     bool is() const {
@@ -625,68 +625,91 @@ struct ConfigValue {
     }
 
     template <typename T>
-    T & get() {
-        return std::get<T>(value_);
-    }
-
-    template <typename T>
     const T & get() const {
         return std::get<T>(value_);
     }
 
-    Variant & variant() { return value_; }
+    std::string_view key() const { return key_; }
+
     const Variant & variant() const { return value_; }
 
+    // equality by key only
+    bool operator==(const Value & other) const noexcept {
+        return key_ == other.key_;
+    }
+
+    // transparent equality for heterogeneous lookup
+    friend bool operator==(const Value & v, std::string_view k) noexcept {
+        return v.key_ == k;
+    }
+
+    friend bool operator==(std::string_view k, const Value & v) noexcept {
+        return k == v.key_;
+    }
+
+    struct Hash {
+        using is_transparent = void;
+
+        std::size_t operator()(const Value & v) const noexcept {
+            return std::hash<std::string_view>{}(v.key_);
+        }
+
+        std::size_t operator()(std::string_view k) const noexcept {
+            return std::hash<std::string_view>{}(k);
+        }
+    };
+
 private:
-    Variant value_;
+    const Variant value_;
+    const std::string key_;
+};
+
+class Config {
+public:
+    using Container = std::unordered_set<Value, Value::Hash, std::equal_to<>>;
+
+    Config() = default;
+    explicit Config(std::vector<Value> values);
+
+    Value operator[](std::string key) const;
+    bool has_key(std::string_view key) const;
+    size_t size() const noexcept;
+
+    bool contains(std::string_view key) const { return has_key(key); }
+
+    template <typename T>
+    bool is(std::string_view key) const {
+        const Value * value = find_value(key);
+        if (!value) {
+            return false;
+        }
+        return value->template is<T>();
+    }
+
+    template <typename T>
+    const T & get(std::string_view key) const {
+        return at(key).template get<T>();
+    }
+
+    const Container & values() const noexcept { return values_; }
+
+private:
+    const Value & at(std::string_view key) const;
+    const Value * find_value(std::string_view key) const noexcept;
+
+    Container values_;
 };
 
 class Model : public nn::Module {
 public:
-    using ConfigValue = ggml::torch::ConfigValue;
-    struct Config : public std::map<std::string, ConfigValue> {
-        using Base = std::map<std::string, ConfigValue>;
-        using Base::Base;
-
-        Config() = default;
-        Config(const Config &) = default;
-        Config(Config &&) noexcept = default;
-        Config & operator=(const Config &) = default;
-        Config & operator=(Config &&) noexcept = default;
-        virtual ~Config() = default;
-
-        bool contains(const std::string & key) const {
-            return this->find(key) != this->end();
-        }
-
-        template <typename T>
-        bool is(const std::string & key) const {
-            auto it = this->find(key);
-            if (it == this->end()) {
-                return false;
-            }
-            return it->second.template is<T>();
-        }
-
-        template <typename T>
-        T & get(const std::string & key) {
-            return this->at(key).template get<T>();
-        }
-
-        template <typename T>
-        const T & get(const std::string & key) const {
-            return this->at(key).template get<T>();
-        }
-    };
-
-    using ConfigMap = Config;
+    using ConfigValue = Value;
+    using ConfigMap   = Config;
 
     explicit Model(std::shared_ptr<Context> context);
 
-    ConfigMap       & config() { return config_; }
     const ConfigMap & config() const { return config_; }
     void set_config(ConfigMap config) { config_ = std::move(config); }
-    void clear_config() { config_.clear(); }
+    void clear_config() { config_ = ConfigMap{}; }
 
     Model(Model &&) noexcept = default;
     Model & operator=(Model &&) noexcept = default;
@@ -782,11 +805,12 @@ public:
         return load_from_gguf_with_resolver<TModel>(gguf_path, std::move(resolver));
     }
 
+    static Config load_config_from_gguf(const std::string & gguf_path);
+
 private:
     static std::shared_ptr<Context> create_context_for_file(const std::string & gguf_path);
     static struct ggml_init_params default_context_params_from_file(const std::string & gguf_path);
 
-    static void load_config_from_gguf(Model & model, const std::string & gguf_path);
     static std::vector<BackendBuffer>
     load_weights_from_gguf(Model & model, const std::string & gguf_path, BackendResolver & resolver);
 
@@ -804,7 +828,7 @@ private:
         auto model   = std::make_shared<TModel>(std::move(context));
 
         std::shared_ptr<Model> base_model = model;
-        load_config_from_gguf(*base_model, gguf_path);
+        base_model->set_config(load_config_from_gguf(gguf_path));
         auto parameter_buffers = load_weights_from_gguf(*base_model, gguf_path, resolver);
         Generator generator(base_model, std::move(parameter_buffers));
         return {std::move(model), std::move(generator)};
