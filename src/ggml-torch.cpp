@@ -125,6 +125,8 @@ std::vector<std::string> convert_string_array(const struct gguf_context * ctx, i
     return result;
 }
 
+} // namespace
+
 Config::Config(std::vector<Value> values) {
     values_.reserve(values.size());
     for (Value & value : values) {
@@ -156,14 +158,13 @@ const Value & Config::at(std::string_view key) const {
 }
 
 const Value * Config::find_value(std::string_view key) const noexcept {
-    const auto it = values_.find(key);
+    const Value candidate(std::string(key), int64_t{0});
+    const auto it = values_.find(candidate);
     if (it != values_.end()) {
         return std::addressof(*it);
     }
     return nullptr;
 }
-
-} // namespace
 
 Tensor::Tensor(ggml_tensor * tensor, std::shared_ptr<Context> ctx)
     : tensor_(tensor), context_(std::move(ctx)) {
@@ -1450,11 +1451,22 @@ BackendBuffer Context::allocate_tensors(ggml_backend_buffer_type_t buffer_type) 
 
 namespace nn {
 
-Module::Module(std::shared_ptr<Context> ctx)
-    : ctx_(std::move(ctx)) {
+Module::Module(std::shared_ptr<Context> ctx, const Config * config)
+    : ctx_(std::move(ctx)), config_(config) {
     if (!ctx_) {
         throw std::invalid_argument("ggml::torch::nn::Module requires a valid context");
     }
+}
+
+const Config & Module::config() const {
+    if (!config_) {
+        throw std::logic_error("ggml::torch::nn::Module does not have an associated configuration");
+    }
+    return *config_;
+}
+
+void Module::set_config_reference(const Config & config) {
+    config_ = &config;
 }
 
 Tensor & Module::register_parameter(const std::string & name, const Tensor & tensor) {
@@ -1485,6 +1497,9 @@ std::shared_ptr<Module> Module::register_module(const std::string & name, std::s
     }
     if (module->ctx().get() != ctx_.get()) {
         throw std::invalid_argument("registered module must share the same ggml context");
+    }
+    if (config_ && !module->config_) {
+        module->config_ = config_;
     }
     modules_[name] = std::move(module);
     return modules_[name];
@@ -1547,8 +1562,13 @@ std::vector<Tensor> Module::buffers(bool recurse) const {
 
 } // namespace nn
 
-Linear::Linear(std::shared_ptr<Context> context, int64_t in_features, int64_t out_features, bool bias, ggml_type type)
-    : Module(std::move(context)), in_features_(in_features), out_features_(out_features) {
+Linear::Linear(std::shared_ptr<Context> context,
+               const Config & config,
+               int64_t in_features,
+               int64_t out_features,
+               bool bias,
+               ggml_type type)
+    : Module(std::move(context), &config), in_features_(in_features), out_features_(out_features) {
     if (in_features <= 0 || out_features <= 0) {
         throw std::invalid_argument("ggml::torch::Linear requires positive feature sizes");
     }
@@ -1575,8 +1595,11 @@ Tensor Linear::forward(const Tensor & input) {
     return output;
 }
 
-RotaryEmbedding::RotaryEmbedding(std::shared_ptr<Context> context, int64_t dims, Tensor::RopeConfig config)
-    : Module(std::move(context)), dims_(dims), config_(config) {
+RotaryEmbedding::RotaryEmbedding(std::shared_ptr<Context> context,
+                                 const Config & config,
+                                 int64_t dims,
+                                 Tensor::RopeConfig rope_config)
+    : Module(std::move(context), &config), dims_(dims), config_(rope_config) {
     if (dims_ <= 0) {
         throw std::invalid_argument("ggml::torch::RotaryEmbedding requires a positive dimension");
     }
@@ -1622,8 +1645,12 @@ std::pair<Tensor, Tensor> RotaryEmbedding::apply(const Tensor & query,
     return {rotated_query, rotated_key};
 }
 
-Embedding::Embedding(std::shared_ptr<Context> context, int64_t num_embeddings, int64_t embedding_dim, ggml_type type)
-    : Module(std::move(context)), num_embeddings_(num_embeddings), embedding_dim_(embedding_dim) {
+Embedding::Embedding(std::shared_ptr<Context> context,
+                     const Config & config,
+                     int64_t num_embeddings,
+                     int64_t embedding_dim,
+                     ggml_type type)
+    : Module(std::move(context), &config), num_embeddings_(num_embeddings), embedding_dim_(embedding_dim) {
     if (num_embeddings <= 0 || embedding_dim <= 0) {
         throw std::invalid_argument("ggml::torch::Embedding requires positive dimensions");
     }
@@ -1643,11 +1670,12 @@ Tensor Embedding::forward(const Tensor & input) {
 }
 
 LayerNorm::LayerNorm(std::shared_ptr<Context> context,
+                     const Config & config,
                      std::vector<int64_t> normalized_shape,
                      float eps,
                      bool elementwise_affine,
                      ggml_type type)
-    : Module(std::move(context)),
+    : Module(std::move(context), &config),
       normalized_shape_(std::move(normalized_shape)),
       eps_(eps),
       elementwise_affine_(elementwise_affine) {
@@ -1679,8 +1707,12 @@ Tensor LayerNorm::forward(const Tensor & input) {
     return result;
 }
 
-RMSNorm::RMSNorm(std::shared_ptr<Context> context, int64_t normalized_shape, float eps, ggml_type type)
-    : Module(std::move(context)), eps_(eps) {
+RMSNorm::RMSNorm(std::shared_ptr<Context> context,
+                 const Config & config,
+                 int64_t normalized_shape,
+                 float eps,
+                 ggml_type type)
+    : Module(std::move(context), &config), eps_(eps) {
     if (normalized_shape <= 0) {
         throw std::invalid_argument("ggml::torch::RMSNorm requires a positive normalized_shape");
     }
@@ -1700,8 +1732,8 @@ Tensor RMSNorm::forward(const Tensor & input) {
     return result.mul(weight_.repeat_like(result));
 }
 
-ReLU::ReLU(std::shared_ptr<Context> context)
-    : Module(std::move(context)) {
+ReLU::ReLU(std::shared_ptr<Context> context, const Config & config)
+    : Module(std::move(context), &config) {
 }
 
 Tensor ReLU::forward(const Tensor & input) {
@@ -1714,8 +1746,8 @@ Tensor ReLU::forward(const Tensor & input) {
     return input.relu();
 }
 
-SiLU::SiLU(std::shared_ptr<Context> context)
-    : Module(std::move(context)) {
+SiLU::SiLU(std::shared_ptr<Context> context, const Config & config)
+    : Module(std::move(context), &config) {
 }
 
 Tensor SiLU::forward(const Tensor & input) {
@@ -1728,8 +1760,8 @@ Tensor SiLU::forward(const Tensor & input) {
     return input.silu();
 }
 
-GELU::GELU(std::shared_ptr<Context> context, bool approximate)
-    : Module(std::move(context)), approximate_(approximate) {
+GELU::GELU(std::shared_ptr<Context> context, const Config & config, bool approximate)
+    : Module(std::move(context), &config), approximate_(approximate) {
 }
 
 Tensor GELU::forward(const Tensor & input) {
@@ -1742,8 +1774,8 @@ Tensor GELU::forward(const Tensor & input) {
     return input.gelu(approximate_);
 }
 
-Sigmoid::Sigmoid(std::shared_ptr<Context> context)
-    : Module(std::move(context)) {
+Sigmoid::Sigmoid(std::shared_ptr<Context> context, const Config & config)
+    : Module(std::move(context), &config) {
 }
 
 Tensor Sigmoid::forward(const Tensor & input) {
@@ -1756,8 +1788,8 @@ Tensor Sigmoid::forward(const Tensor & input) {
     return input.sigmoid();
 }
 
-Tanh::Tanh(std::shared_ptr<Context> context)
-    : Module(std::move(context)) {
+Tanh::Tanh(std::shared_ptr<Context> context, const Config & config)
+    : Module(std::move(context), &config) {
 }
 
 Tensor Tanh::forward(const Tensor & input) {
@@ -1770,8 +1802,8 @@ Tensor Tanh::forward(const Tensor & input) {
     return input.tanh();
 }
 
-ELU::ELU(std::shared_ptr<Context> context, float alpha)
-    : Module(std::move(context)), alpha_(alpha) {
+ELU::ELU(std::shared_ptr<Context> context, const Config & config, float alpha)
+    : Module(std::move(context), &config), alpha_(alpha) {
     if (!std::isfinite(alpha_)) {
         throw std::invalid_argument("ggml::torch::ELU requires a finite alpha value");
     }
@@ -1790,8 +1822,8 @@ Tensor ELU::forward(const Tensor & input) {
     return input.elu();
 }
 
-LeakyReLU::LeakyReLU(std::shared_ptr<Context> context, float negative_slope)
-    : Module(std::move(context)), negative_slope_(negative_slope) {
+LeakyReLU::LeakyReLU(std::shared_ptr<Context> context, const Config & config, float negative_slope)
+    : Module(std::move(context), &config), negative_slope_(negative_slope) {
     if (!std::isfinite(negative_slope_)) {
         throw std::invalid_argument("ggml::torch::LeakyReLU requires a finite negative slope");
     }
@@ -1807,8 +1839,8 @@ Tensor LeakyReLU::forward(const Tensor & input) {
     return input.leaky_relu(negative_slope_);
 }
 
-Softmax::Softmax(std::shared_ptr<Context> context, int64_t dim)
-    : Module(std::move(context)), dim_(dim) {
+Softmax::Softmax(std::shared_ptr<Context> context, const Config & config, int64_t dim)
+    : Module(std::move(context), &config), dim_(dim) {
 }
 
 Tensor Softmax::forward(const Tensor & input) {
@@ -1829,23 +1861,24 @@ Tensor Softmax::forward(const Tensor & input) {
 }
 
 FeedForward::FeedForward(std::shared_ptr<Context> context,
+                         const Config & config,
                          int64_t embed_dim,
                          int64_t hidden_dim,
                          bool gated,
                          ggml_type type)
-    : Module(std::move(context)), gated_(gated) {
+    : Module(std::move(context), &config), gated_(gated) {
     if (embed_dim <= 0 || hidden_dim <= 0) {
         throw std::invalid_argument("ggml::torch::FeedForward requires positive dimensions");
     }
 
     auto shared = ctx();
-    up_proj_   = std::make_shared<Linear>(shared, embed_dim, hidden_dim, true, type);
-    down_proj_ = std::make_shared<Linear>(shared, hidden_dim, embed_dim, true, type);
+    up_proj_   = std::make_shared<Linear>(shared, this->config(), embed_dim, hidden_dim, true, type);
+    down_proj_ = std::make_shared<Linear>(shared, this->config(), hidden_dim, embed_dim, true, type);
     register_module("up_proj", up_proj_);
     register_module("down_proj", down_proj_);
 
     if (gated_) {
-        gate_proj_ = std::make_shared<Linear>(shared, embed_dim, hidden_dim, true, type);
+        gate_proj_ = std::make_shared<Linear>(shared, this->config(), embed_dim, hidden_dim, true, type);
         register_module("gate_proj", gate_proj_);
     }
 }
@@ -1869,12 +1902,13 @@ Tensor FeedForward::forward(const Tensor & input) {
 }
 
 MultiheadAttention::MultiheadAttention(std::shared_ptr<Context> context,
+                                       const Config & config,
                                        int64_t embed_dim,
                                        int64_t num_heads,
                                        bool bias,
                                        ggml_type type,
                                        Tensor::RopeConfig rope)
-    : Module(std::move(context)),
+    : Module(std::move(context), &config),
       embed_dim_(embed_dim),
       num_heads_(num_heads),
       rope_(rope) {
@@ -1891,10 +1925,10 @@ MultiheadAttention::MultiheadAttention(std::shared_ptr<Context> context,
     }
 
     auto shared = ctx();
-    q_proj_ = std::make_shared<Linear>(shared, embed_dim_, embed_dim_, bias, type);
-    k_proj_ = std::make_shared<Linear>(shared, embed_dim_, embed_dim_, bias, type);
-    v_proj_ = std::make_shared<Linear>(shared, embed_dim_, embed_dim_, bias, type);
-    o_proj_ = std::make_shared<Linear>(shared, embed_dim_, embed_dim_, bias, type);
+    q_proj_ = std::make_shared<Linear>(shared, this->config(), embed_dim_, embed_dim_, bias, type);
+    k_proj_ = std::make_shared<Linear>(shared, this->config(), embed_dim_, embed_dim_, bias, type);
+    v_proj_ = std::make_shared<Linear>(shared, this->config(), embed_dim_, embed_dim_, bias, type);
+    o_proj_ = std::make_shared<Linear>(shared, this->config(), embed_dim_, embed_dim_, bias, type);
 
     register_module("q_proj", q_proj_);
     register_module("k_proj", k_proj_);
@@ -1954,12 +1988,14 @@ Tensor MultiheadAttention::forward(const Tensor & input) {
     return output;
 }
 
-Sequential::Sequential(std::shared_ptr<Context> context)
-    : Module(std::move(context)) {
+Sequential::Sequential(std::shared_ptr<Context> context, const Config & config)
+    : Module(std::move(context), &config) {
 }
 
-Sequential::Sequential(std::shared_ptr<Context> context, std::initializer_list<std::shared_ptr<Module>> modules)
-    : Sequential(std::move(context)) {
+Sequential::Sequential(std::shared_ptr<Context> context,
+                       const Config & config,
+                       std::initializer_list<std::shared_ptr<Module>> modules)
+    : Sequential(std::move(context), config) {
     size_t index = 0;
     for (auto module : modules) {
         append(std::to_string(index++), std::move(module));
@@ -1993,8 +2029,10 @@ Sequential & Sequential::append(std::shared_ptr<Module> module) {
     return append(name, std::move(module));
 }
 
-Model::Model(std::shared_ptr<Context> context)
-    : nn::Module(std::move(context)) {
+Model::Model(std::shared_ptr<Context> context, ConfigMap config)
+    : nn::Module(std::move(context)),
+      config_(std::move(config)) {
+    set_config_reference(config_);
 }
 
 Generator::Generator(std::shared_ptr<Model> model, std::vector<BackendBuffer> parameter_buffers)

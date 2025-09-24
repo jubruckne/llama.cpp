@@ -26,6 +26,7 @@ namespace ggml::torch {
 class Context;
 class Backend;
 class BackendBuffer;
+class Config;
 
 class BackendScheduler;
 
@@ -296,7 +297,7 @@ namespace nn {
 
 class Module : public std::enable_shared_from_this<Module> {
 public:
-    explicit Module(std::shared_ptr<Context> ctx);
+    explicit Module(std::shared_ptr<Context> ctx, const Config * config = nullptr);
     virtual ~Module() = default;
 
     Module(const Module &) = delete;
@@ -325,8 +326,13 @@ protected:
     const ParameterMap & buffers_map() const { return buffers_; }
     const ModuleMap    & modules_map() const { return modules_; }
 
+    const Config & config() const;
+    bool has_config() const noexcept { return config_ != nullptr; }
+    void set_config_reference(const Config & config);
+
 private:
     std::shared_ptr<Context> ctx_;
+    const Config * config_ = nullptr;
     ParameterMap parameters_;
     ParameterMap buffers_;
     ModuleMap modules_;
@@ -336,7 +342,12 @@ private:
 
 class Linear : public nn::Module {
 public:
-    Linear(std::shared_ptr<Context> context, int64_t in_features, int64_t out_features, bool bias = true, ggml_type type = GGML_TYPE_F32);
+    Linear(std::shared_ptr<Context> context,
+           const Config & config,
+           int64_t in_features,
+           int64_t out_features,
+           bool bias = true,
+           ggml_type type = GGML_TYPE_F32);
 
     Tensor forward(const Tensor & input) override;
 
@@ -354,7 +365,10 @@ private:
 
 class RotaryEmbedding : public nn::Module {
 public:
-    RotaryEmbedding(std::shared_ptr<Context> context, int64_t dims, Tensor::RopeConfig config = {});
+    RotaryEmbedding(std::shared_ptr<Context> context,
+                    const Config & config,
+                    int64_t dims,
+                    Tensor::RopeConfig rope_config = {});
 
     Tensor forward(const Tensor & positions) override;
 
@@ -376,6 +390,7 @@ private:
 class FeedForward : public nn::Module {
 public:
     FeedForward(std::shared_ptr<Context> context,
+                const Config & config,
                 int64_t embed_dim,
                 int64_t hidden_dim,
                 bool gated = true,
@@ -397,6 +412,7 @@ private:
 class MultiheadAttention : public nn::Module {
 public:
     MultiheadAttention(std::shared_ptr<Context> context,
+                       const Config & config,
                        int64_t embed_dim,
                        int64_t num_heads,
                        bool bias = true,
@@ -432,7 +448,11 @@ private:
 
 class Embedding : public nn::Module {
 public:
-    Embedding(std::shared_ptr<Context> context, int64_t num_embeddings, int64_t embedding_dim, ggml_type type = GGML_TYPE_F32);
+    Embedding(std::shared_ptr<Context> context,
+              const Config & config,
+              int64_t num_embeddings,
+              int64_t embedding_dim,
+              ggml_type type = GGML_TYPE_F32);
 
     Tensor forward(const Tensor & input) override;
 
@@ -449,6 +469,7 @@ private:
 class LayerNorm : public nn::Module {
 public:
     LayerNorm(std::shared_ptr<Context> context,
+              const Config & config,
               std::vector<int64_t> normalized_shape,
               float eps = 1e-5f,
               bool elementwise_affine = true,
@@ -471,6 +492,7 @@ private:
 class RMSNorm : public nn::Module {
 public:
     RMSNorm(std::shared_ptr<Context> context,
+            const Config & config,
             int64_t normalized_shape,
             float eps = 1e-5f,
             ggml_type type = GGML_TYPE_F32);
@@ -487,21 +509,21 @@ private:
 
 class ReLU : public nn::Module {
 public:
-    explicit ReLU(std::shared_ptr<Context> context);
+    ReLU(std::shared_ptr<Context> context, const Config & config);
 
     Tensor forward(const Tensor & input) override;
 };
 
 class SiLU : public nn::Module {
 public:
-    explicit SiLU(std::shared_ptr<Context> context);
+    SiLU(std::shared_ptr<Context> context, const Config & config);
 
     Tensor forward(const Tensor & input) override;
 };
 
 class GELU : public nn::Module {
 public:
-    GELU(std::shared_ptr<Context> context, bool approximate = true);
+    GELU(std::shared_ptr<Context> context, const Config & config, bool approximate = true);
 
     Tensor forward(const Tensor & input) override;
 
@@ -513,21 +535,21 @@ private:
 
 class Sigmoid : public nn::Module {
 public:
-    explicit Sigmoid(std::shared_ptr<Context> context);
+    Sigmoid(std::shared_ptr<Context> context, const Config & config);
 
     Tensor forward(const Tensor & input) override;
 };
 
 class Tanh : public nn::Module {
 public:
-    explicit Tanh(std::shared_ptr<Context> context);
+    Tanh(std::shared_ptr<Context> context, const Config & config);
 
     Tensor forward(const Tensor & input) override;
 };
 
 class ELU : public nn::Module {
 public:
-    ELU(std::shared_ptr<Context> context, float alpha = 1.0f);
+    ELU(std::shared_ptr<Context> context, const Config & config, float alpha = 1.0f);
 
     Tensor forward(const Tensor & input) override;
 
@@ -539,7 +561,7 @@ private:
 
 class LeakyReLU : public nn::Module {
 public:
-    LeakyReLU(std::shared_ptr<Context> context, float negative_slope = 0.01f);
+    LeakyReLU(std::shared_ptr<Context> context, const Config & config, float negative_slope = 0.01f);
 
     Tensor forward(const Tensor & input) override;
 
@@ -551,7 +573,7 @@ private:
 
 class Softmax : public nn::Module {
 public:
-    Softmax(std::shared_ptr<Context> context, int64_t dim = -1);
+    Softmax(std::shared_ptr<Context> context, const Config & config, int64_t dim = -1);
 
     Tensor forward(const Tensor & input) override;
 
@@ -563,8 +585,10 @@ private:
 
 class Sequential : public nn::Module {
 public:
-    explicit Sequential(std::shared_ptr<Context> context);
-    Sequential(std::shared_ptr<Context> context, std::initializer_list<std::shared_ptr<Module>> modules);
+    Sequential(std::shared_ptr<Context> context, const Config & config);
+    Sequential(std::shared_ptr<Context> context,
+               const Config & config,
+               std::initializer_list<std::shared_ptr<Module>> modules);
 
     Tensor forward(const Tensor & input) override;
 
@@ -705,11 +729,9 @@ public:
     using ConfigValue = Value;
     using ConfigMap   = Config;
 
-    explicit Model(std::shared_ptr<Context> context);
+    Model(std::shared_ptr<Context> context, ConfigMap config);
 
     const ConfigMap & config() const { return config_; }
-    void set_config(ConfigMap config) { config_ = std::move(config); }
-    void clear_config() { config_ = ConfigMap{}; }
 
     Model(Model &&) noexcept = default;
     Model & operator=(Model &&) noexcept = default;
@@ -825,10 +847,10 @@ private:
         }
 
         auto context = create_context_for_file(gguf_path);
-        auto model   = std::make_shared<TModel>(std::move(context));
+        auto config  = load_config_from_gguf(gguf_path);
+        auto model   = std::make_shared<TModel>(std::move(context), std::move(config));
 
         std::shared_ptr<Model> base_model = model;
-        base_model->set_config(load_config_from_gguf(gguf_path));
         auto parameter_buffers = load_weights_from_gguf(*base_model, gguf_path, resolver);
         Generator generator(base_model, std::move(parameter_buffers));
         return {std::move(model), std::move(generator)};
