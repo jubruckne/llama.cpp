@@ -15,6 +15,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -122,6 +123,44 @@ std::vector<std::string> convert_string_array(const struct gguf_context * ctx, i
         result.emplace_back(gguf_get_arr_str(ctx, key_id, i));
     }
     return result;
+}
+
+Config::Config(std::vector<Value> values) {
+    values_.reserve(values.size());
+    for (Value & value : values) {
+        const auto [_, inserted] = values_.insert(std::move(value));
+        if (!inserted) {
+            throw std::invalid_argument("duplicate keys in configuration");
+        }
+    }
+}
+
+Value Config::operator[](std::string key) const {
+    return at(key);
+}
+
+bool Config::has_key(std::string_view key) const {
+    return find_value(key) != nullptr;
+}
+
+size_t Config::size() const noexcept {
+    return values_.size();
+}
+
+const Value & Config::at(std::string_view key) const {
+    const Value * value = find_value(key);
+    if (!value) {
+        throw std::out_of_range("key not found in configuration");
+    }
+    return *value;
+}
+
+const Value * Config::find_value(std::string_view key) const noexcept {
+    const auto it = values_.find(key);
+    if (it != values_.end()) {
+        return std::addressof(*it);
+    }
+    return nullptr;
 }
 
 } // namespace
@@ -2256,7 +2295,7 @@ std::vector<int> Generator::generate(std::vector<int> prompt, int n) {
 }
 
 
-void Loader::load_config_from_gguf(Model & model, const std::string & path) {
+Config Loader::load_config_from_gguf(const std::string & path) {
     struct gguf_init_params params {
         /*.no_alloc =*/ true,
         /*.ctx      =*/ nullptr,
@@ -2267,48 +2306,52 @@ void Loader::load_config_from_gguf(Model & model, const std::string & path) {
         throw std::runtime_error("failed to open GGUF file for configuration loading");
     }
 
-    auto & config = model.config();
-    config.clear();
+    const int64_t n_kv_raw = gguf_get_n_kv(ctx.get());
+    if (n_kv_raw < 0) {
+        throw std::runtime_error("GGUF file reported a negative configuration count");
+    }
 
-    const int64_t n_kv = gguf_get_n_kv(ctx.get());
-    for (int64_t i = 0; i < n_kv; ++i) {
+    std::vector<Value> values;
+    values.reserve(static_cast<size_t>(n_kv_raw));
+
+    for (int64_t i = 0; i < n_kv_raw; ++i) {
         const std::string key = gguf_get_key(ctx.get(), i);
         switch (gguf_get_kv_type(ctx.get(), i)) {
             case GGUF_TYPE_UINT8:
-                config[key] = static_cast<uint64_t>(gguf_get_val_u8(ctx.get(), i));
+                values.emplace_back(key, static_cast<uint8_t>(gguf_get_val_u8(ctx.get(), i)));
                 break;
             case GGUF_TYPE_INT8:
-                config[key] = static_cast<int64_t>(gguf_get_val_i8(ctx.get(), i));
+                values.emplace_back(key, static_cast<int8_t>(gguf_get_val_i8(ctx.get(), i)));
                 break;
             case GGUF_TYPE_UINT16:
-                config[key] = static_cast<uint64_t>(gguf_get_val_u16(ctx.get(), i));
+                values.emplace_back(key, static_cast<uint16_t>(gguf_get_val_u16(ctx.get(), i)));
                 break;
             case GGUF_TYPE_INT16:
-                config[key] = static_cast<int64_t>(gguf_get_val_i16(ctx.get(), i));
+                values.emplace_back(key, static_cast<int16_t>(gguf_get_val_i16(ctx.get(), i)));
                 break;
             case GGUF_TYPE_UINT32:
-                config[key] = static_cast<uint64_t>(gguf_get_val_u32(ctx.get(), i));
+                values.emplace_back(key, static_cast<uint32_t>(gguf_get_val_u32(ctx.get(), i)));
                 break;
             case GGUF_TYPE_INT32:
-                config[key] = static_cast<int64_t>(gguf_get_val_i32(ctx.get(), i));
-                break;
-            case GGUF_TYPE_FLOAT32:
-                config[key] = static_cast<double>(gguf_get_val_f32(ctx.get(), i));
-                break;
-            case GGUF_TYPE_BOOL:
-                config[key] = gguf_get_val_bool(ctx.get(), i);
-                break;
-            case GGUF_TYPE_STRING:
-                config[key] = std::string(gguf_get_val_str(ctx.get(), i));
+                values.emplace_back(key, static_cast<int32_t>(gguf_get_val_i32(ctx.get(), i)));
                 break;
             case GGUF_TYPE_UINT64:
-                config[key] = gguf_get_val_u64(ctx.get(), i);
+                values.emplace_back(key, gguf_get_val_u64(ctx.get(), i));
                 break;
             case GGUF_TYPE_INT64:
-                config[key] = gguf_get_val_i64(ctx.get(), i);
+                values.emplace_back(key, gguf_get_val_i64(ctx.get(), i));
+                break;
+            case GGUF_TYPE_FLOAT32:
+                values.emplace_back(key, gguf_get_val_f32(ctx.get(), i));
                 break;
             case GGUF_TYPE_FLOAT64:
-                config[key] = gguf_get_val_f64(ctx.get(), i);
+                values.emplace_back(key, gguf_get_val_f64(ctx.get(), i));
+                break;
+            case GGUF_TYPE_BOOL:
+                values.emplace_back(key, gguf_get_val_bool(ctx.get(), i));
+                break;
+            case GGUF_TYPE_STRING:
+                values.emplace_back(key, std::string(gguf_get_val_str(ctx.get(), i)));
                 break;
             case GGUF_TYPE_ARRAY: {
                 const size_t count = gguf_get_arr_n(ctx.get(), i);
@@ -2316,50 +2359,50 @@ void Loader::load_config_from_gguf(Model & model, const std::string & path) {
                 switch (elem_type) {
                     case GGUF_TYPE_UINT8: {
                         const auto * data = static_cast<const uint8_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config[key] = std::vector<uint8_t>(data, data + count);
+                        values.emplace_back(key, std::vector<uint8_t>(data, data + count));
                     } break;
                     case GGUF_TYPE_INT8: {
                         const auto * data = static_cast<const int8_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config[key] = convert_numeric_array<int64_t>(data, count);
+                        values.emplace_back(key, std::vector<int8_t>(data, data + count));
                     } break;
                     case GGUF_TYPE_UINT16: {
                         const auto * data = static_cast<const uint16_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config[key] = convert_numeric_array<uint64_t>(data, count);
+                        values.emplace_back(key, std::vector<uint16_t>(data, data + count));
                     } break;
                     case GGUF_TYPE_INT16: {
                         const auto * data = static_cast<const int16_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config[key] = convert_numeric_array<int64_t>(data, count);
+                        values.emplace_back(key, std::vector<int16_t>(data, data + count));
                     } break;
                     case GGUF_TYPE_UINT32: {
                         const auto * data = static_cast<const uint32_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config[key] = convert_numeric_array<uint64_t>(data, count);
+                        values.emplace_back(key, std::vector<uint32_t>(data, data + count));
                     } break;
                     case GGUF_TYPE_INT32: {
                         const auto * data = static_cast<const int32_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config[key] = convert_numeric_array<int64_t>(data, count);
+                        values.emplace_back(key, std::vector<int32_t>(data, data + count));
                     } break;
                     case GGUF_TYPE_UINT64: {
                         const auto * data = static_cast<const uint64_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config[key] = std::vector<uint64_t>(data, data + count);
+                        values.emplace_back(key, std::vector<uint64_t>(data, data + count));
                     } break;
                     case GGUF_TYPE_INT64: {
                         const auto * data = static_cast<const int64_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config[key] = std::vector<int64_t>(data, data + count);
+                        values.emplace_back(key, std::vector<int64_t>(data, data + count));
                     } break;
                     case GGUF_TYPE_FLOAT32: {
                         const auto * data = static_cast<const float *>(gguf_get_arr_data(ctx.get(), i));
-                        config[key] = std::vector<float>(data, data + count);
+                        values.emplace_back(key, std::vector<float>(data, data + count));
                     } break;
                     case GGUF_TYPE_FLOAT64: {
                         const auto * data = static_cast<const double *>(gguf_get_arr_data(ctx.get(), i));
-                        config[key] = std::vector<double>(data, data + count);
+                        values.emplace_back(key, std::vector<double>(data, data + count));
                     } break;
                     case GGUF_TYPE_BOOL: {
                         const auto * data = static_cast<const int8_t *>(gguf_get_arr_data(ctx.get(), i));
-                        config[key] = convert_bool_array(data, count);
+                        values.emplace_back(key, convert_bool_array(data, count));
                     } break;
                     case GGUF_TYPE_STRING:
-                        config[key] = convert_string_array(ctx.get(), i, count);
+                        values.emplace_back(key, convert_string_array(ctx.get(), i, count));
                         break;
                     default:
                         throw std::runtime_error("unsupported GGUF array type in configuration");
@@ -2369,6 +2412,8 @@ void Loader::load_config_from_gguf(Model & model, const std::string & path) {
                 throw std::runtime_error("unsupported GGUF value type in configuration");
         }
     }
+
+    return Config(std::move(values));
 }
 
 std::vector<BackendBuffer> Loader::load_weights_from_gguf(Model & model,
