@@ -141,10 +141,6 @@ Value Config::operator[](std::string key) const {
     return at(key);
 }
 
-bool Config::has_key(std::string_view key) const {
-    return find_value(key) != nullptr;
-}
-
 size_t Config::size() const noexcept {
     return values_.size();
 }

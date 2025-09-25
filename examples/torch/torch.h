@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <concepts>
 #include <functional>
 #include <initializer_list>
 #include <map>
@@ -30,6 +31,11 @@ class Config;
 
 class BackendScheduler;
 class Model;
+
+template <typename T>
+concept KeyPartConcept =
+    std::is_convertible_v<std::decay_t<T>, std::string_view> ||
+    std::integral<std::remove_reference_t<T>>;
 
 class Tensor {
 public:
@@ -683,28 +689,76 @@ public:
     explicit Config(std::vector<Value> values);
 
     Value operator[](std::string key) const;
-    bool has_key(std::string_view key) const;
     size_t size() const noexcept;
 
-    bool contains(std::string_view key) const { return has_key(key); }
+    template <typename... Keys>
+    bool contains(Keys &&... keys) const {
+        static_assert(sizeof...(Keys) > 0, "contains requires at least one key part");
+        const std::string key = build_key(std::forward<Keys>(keys)...);
+        return find_value(key) != nullptr;
+    }
 
-    template <typename T>
-    bool is(std::string_view key) const {
-        const Value * value = find_value(key);
+    template <typename T, typename... Keys>
+    bool is(Keys &&... keys) const {
+        static_assert(sizeof...(Keys) > 0, "is requires at least one key part");
+        const std::string key = build_key(std::forward<Keys>(keys)...);
+        const Value * value   = find_value(key);
         if (!value) {
             return false;
         }
         return value->template is<T>();
     }
 
-    template <typename T>
-    const T & get(std::string_view key) const {
+    template <typename T, typename... Keys>
+    const T & get(Keys &&... keys) const {
+        static_assert(sizeof...(Keys) > 0, "get requires at least one key part");
+        const std::string key = build_key(std::forward<Keys>(keys)...);
         return at(key).template get<T>();
     }
 
     const Container & values() const noexcept { return values_; }
 
 private:
+    template <KeyPartConcept... Keys>
+    static std::string build_key(Keys &&... keys) {
+        std::array<std::string, sizeof...(Keys)> parts{
+            key_part_to_string(std::forward<Keys>(keys))...
+        };
+
+        size_t total_size = parts.empty() ? 0 : parts.size() - 1; // account for dots
+        for (const auto & part : parts) {
+            total_size += part.size();
+        }
+
+        std::string result;
+        result.reserve(total_size);
+
+        for (size_t i = 0; i < parts.size(); ++i) {
+            if (i > 0) {
+                result.push_back('.');
+            }
+            result.append(parts[i]);
+        }
+
+        return result;
+    }
+
+    template <typename Key>
+    static std::string key_part_to_string(Key && key) {
+        using Decayed = std::decay_t<Key>;
+        if constexpr (std::is_convertible_v<Decayed, std::string_view>) {
+            return std::string(std::string_view(key));
+        } else {
+            static_assert(std::is_integral_v<Decayed>,
+                          "Config key parts must be string-like or integral");
+            if constexpr (std::is_signed_v<Decayed>) {
+                return std::to_string(static_cast<long long>(key));
+            } else {
+                return std::to_string(static_cast<unsigned long long>(key));
+            }
+        }
+    }
+
     const Value & at(std::string_view key) const;
     const Value * find_value(std::string_view key) const noexcept;
 
