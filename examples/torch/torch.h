@@ -29,6 +29,7 @@ class BackendBuffer;
 class Config;
 
 class BackendScheduler;
+class Model;
 
 class Tensor {
 public:
@@ -277,15 +278,15 @@ public:
 
     ggml_context * raw() const noexcept { return ctx_; }
 
-    Tensor wrap(ggml_tensor * tensor);
-    Tensor new_tensor(ggml_type type, std::initializer_list<int64_t> shape);
-    Tensor new_tensor(ggml_type type, const std::vector<int64_t> & shape);
-    Tensor new_f32(float value);
-    Tensor new_i32(std::initializer_list<int32_t> values);
-    Tensor new_i32(int32_t value);
+    Tensor wrap(ggml_tensor * tensor) const;
+    Tensor new_tensor(ggml_type type, std::initializer_list<int64_t> shape) const;
+    Tensor new_tensor(ggml_type type, const std::vector<int64_t> & shape) const;
+    Tensor new_f32(float value) const;
+    Tensor new_i32(std::initializer_list<int32_t> values) const;
+    Tensor new_i32(int32_t value) const;
 
-    BackendBuffer allocate_tensors(const Backend & backend);
-    BackendBuffer allocate_tensors(ggml_backend_buffer_type_t buffer_type);
+    BackendBuffer allocate_tensors(const Backend & backend) const;
+    BackendBuffer allocate_tensors(ggml_backend_buffer_type_t buffer_type) const;
 
 private:
     explicit Context(const ggml_init_params & params);
@@ -297,7 +298,7 @@ namespace nn {
 
 class Module : public std::enable_shared_from_this<Module> {
 public:
-    explicit Module(std::shared_ptr<Context> ctx, const Config * config = nullptr);
+    explicit Module(const Model * model);
     virtual ~Module() = default;
 
     Module(const Module &) = delete;
@@ -316,8 +317,6 @@ public:
 
     std::vector<Tensor> buffers(bool recurse = true) const;
 
-    std::shared_ptr<Context> ctx() const { return ctx_; }
-
 protected:
     using ParameterMap = std::map<std::string, Tensor>;
     using ModuleMap    = std::map<std::string, std::shared_ptr<Module>>;
@@ -326,13 +325,10 @@ protected:
     const ParameterMap & buffers_map() const { return buffers_; }
     const ModuleMap    & modules_map() const { return modules_; }
 
-    const Config & config() const;
-    bool has_config() const noexcept { return config_ != nullptr; }
-    void set_config_reference(const Config & config);
+    const Model & model() const { return *model_; }
 
 private:
-    std::shared_ptr<Context> ctx_;
-    const Config * config_ = nullptr;
+    const Model * model_ = nullptr;
     ParameterMap parameters_;
     ParameterMap buffers_;
     ModuleMap modules_;
@@ -342,8 +338,7 @@ private:
 
 class Linear : public nn::Module {
 public:
-    Linear(std::shared_ptr<Context> context,
-           const Config & config,
+    Linear(const Model & model,
            int64_t in_features,
            int64_t out_features,
            bool bias = true,
@@ -365,8 +360,7 @@ private:
 
 class RotaryEmbedding : public nn::Module {
 public:
-    RotaryEmbedding(std::shared_ptr<Context> context,
-                    const Config & config,
+    RotaryEmbedding(const Model & model,
                     int64_t dims,
                     Tensor::RopeConfig rope_config = {});
 
@@ -389,8 +383,7 @@ private:
 
 class FeedForward : public nn::Module {
 public:
-    FeedForward(std::shared_ptr<Context> context,
-                const Config & config,
+    FeedForward(const Model & model,
                 int64_t embed_dim,
                 int64_t hidden_dim,
                 bool gated = true,
@@ -411,8 +404,7 @@ private:
 
 class MultiheadAttention : public nn::Module {
 public:
-    MultiheadAttention(std::shared_ptr<Context> context,
-                       const Config & config,
+    MultiheadAttention(const Model & model,
                        int64_t embed_dim,
                        int64_t num_heads,
                        bool bias = true,
@@ -448,8 +440,7 @@ private:
 
 class Embedding : public nn::Module {
 public:
-    Embedding(std::shared_ptr<Context> context,
-              const Config & config,
+    Embedding(const Model & model,
               int64_t num_embeddings,
               int64_t embedding_dim,
               ggml_type type = GGML_TYPE_F32);
@@ -468,8 +459,7 @@ private:
 
 class LayerNorm : public nn::Module {
 public:
-    LayerNorm(std::shared_ptr<Context> context,
-              const Config & config,
+    LayerNorm(const Model & model,
               std::vector<int64_t> normalized_shape,
               float eps = 1e-5f,
               bool elementwise_affine = true,
@@ -491,8 +481,7 @@ private:
 
 class RMSNorm : public nn::Module {
 public:
-    RMSNorm(std::shared_ptr<Context> context,
-            const Config & config,
+    RMSNorm(const Model & model,
             int64_t normalized_shape,
             float eps = 1e-5f,
             ggml_type type = GGML_TYPE_F32);
@@ -509,21 +498,21 @@ private:
 
 class ReLU : public nn::Module {
 public:
-    ReLU(std::shared_ptr<Context> context, const Config & config);
+    explicit ReLU(const Model & model);
 
     Tensor forward(const Tensor & input) override;
 };
 
 class SiLU : public nn::Module {
 public:
-    SiLU(std::shared_ptr<Context> context, const Config & config);
+    explicit SiLU(const Model & model);
 
     Tensor forward(const Tensor & input) override;
 };
 
 class GELU : public nn::Module {
 public:
-    GELU(std::shared_ptr<Context> context, const Config & config, bool approximate = true);
+    GELU(const Model & model, bool approximate = true);
 
     Tensor forward(const Tensor & input) override;
 
@@ -535,21 +524,21 @@ private:
 
 class Sigmoid : public nn::Module {
 public:
-    Sigmoid(std::shared_ptr<Context> context, const Config & config);
+    explicit Sigmoid(const Model & model);
 
     Tensor forward(const Tensor & input) override;
 };
 
 class Tanh : public nn::Module {
 public:
-    Tanh(std::shared_ptr<Context> context, const Config & config);
+    explicit Tanh(const Model & model);
 
     Tensor forward(const Tensor & input) override;
 };
 
 class ELU : public nn::Module {
 public:
-    ELU(std::shared_ptr<Context> context, const Config & config, float alpha = 1.0f);
+    ELU(const Model & model, float alpha = 1.0f);
 
     Tensor forward(const Tensor & input) override;
 
@@ -561,7 +550,7 @@ private:
 
 class LeakyReLU : public nn::Module {
 public:
-    LeakyReLU(std::shared_ptr<Context> context, const Config & config, float negative_slope = 0.01f);
+    LeakyReLU(const Model & model, float negative_slope = 0.01f);
 
     Tensor forward(const Tensor & input) override;
 
@@ -573,7 +562,7 @@ private:
 
 class Softmax : public nn::Module {
 public:
-    Softmax(std::shared_ptr<Context> context, const Config & config, int64_t dim = -1);
+    Softmax(const Model & model, int64_t dim = -1);
 
     Tensor forward(const Tensor & input) override;
 
@@ -585,10 +574,8 @@ private:
 
 class Sequential : public nn::Module {
 public:
-    Sequential(std::shared_ptr<Context> context, const Config & config);
-    Sequential(std::shared_ptr<Context> context,
-               const Config & config,
-               std::initializer_list<std::shared_ptr<Module>> modules);
+    explicit Sequential(const Model & model);
+    Sequential(const Model & model, std::initializer_list<std::shared_ptr<Module>> modules);
 
     Tensor forward(const Tensor & input) override;
 
@@ -724,28 +711,39 @@ private:
     Container values_;
 };
 
-class Model : public nn::Module {
+class Model {
 public:
-    using ConfigValue = Value;
-    using ConfigMap   = Config;
+    Model(std::shared_ptr<Context> context, Config config);
+    virtual ~Model() = default;
 
-    Model(std::shared_ptr<Context> context, ConfigMap config);
-
-    const ConfigMap & config() const { return config_; }
-
+    Model(const Model &) = delete;
+    Model & operator=(const Model &) = delete;
     Model(Model &&) noexcept = default;
     Model & operator=(Model &&) noexcept = default;
 
+    virtual Tensor forward(const Tensor & input) = 0;
+
+    const Config * config() const;
+    const Context * ctx() const;
+    std::shared_ptr<Context> shared_context() const;
+
+    std::vector<Tensor> parameters(bool recurse = true) const;
+    std::vector<std::pair<std::string, Tensor>> named_parameters(bool recurse = true) const;
+    std::vector<Tensor> buffers(bool recurse = true) const;
+
 protected:
-    ConfigMap config_{};
+    virtual nn::Module & module() = 0;
+    virtual const nn::Module & module() const = 0;
+
+private:
+    std::shared_ptr<Context> context_;
+    Config config_{};
 };
 
 class Loader;
 
 class Generator {
 public:
-    using ConfigMap       = Model::ConfigMap;
-    using ConfigValue     = Model::ConfigValue;
     using BackendResolver = std::function<Backend &(const std::string &, const Tensor &)>;
 
     Generator(const Generator &) = delete;
@@ -754,7 +752,7 @@ public:
     Generator(Generator &&) noexcept = default;
     Generator & operator=(Generator &&) noexcept = default;
 
-    const ConfigMap & config() const { return model_->config(); }
+    const Config & config() const { return *model_->config(); }
     Model       & model() { return *model_; }
     const Model & model() const { return *model_; }
 
