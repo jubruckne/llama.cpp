@@ -1385,30 +1385,30 @@ Context::~Context() {
     }
 }
 
-Tensor Context::wrap(ggml_tensor * tensor) {
+Tensor Context::wrap(ggml_tensor * tensor) const {
     if (!tensor) {
         throw std::invalid_argument("cannot wrap null ggml_tensor");
     }
-    return Tensor(tensor, assert_shared(this));
+    return Tensor(tensor, assert_shared(const_cast<Context *>(this)));
 }
 
-Tensor Context::new_tensor(ggml_type type, std::initializer_list<int64_t> shape) {
+Tensor Context::new_tensor(ggml_type type, std::initializer_list<int64_t> shape) const {
     auto * tensor = new_tensor_from_range(ctx_, type, shape.begin(), shape.end());
     return wrap(tensor);
 }
 
-Tensor Context::new_tensor(ggml_type type, const std::vector<int64_t> & shape) {
+Tensor Context::new_tensor(ggml_type type, const std::vector<int64_t> & shape) const {
     auto * tensor = new_tensor_from_range(ctx_, type, shape.begin(), shape.end());
     return wrap(tensor);
 }
 
-Tensor Context::new_f32(float value) {
+Tensor Context::new_f32(float value) const {
     auto * tensor = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, 1);
     *static_cast<float *>(tensor->data) = value;
     return wrap(tensor);
 }
 
-Tensor Context::new_i32(std::initializer_list<int32_t> values) {
+Tensor Context::new_i32(std::initializer_list<int32_t> values) const {
     if (values.size() == 1) {
         return new_i32(*values.begin());
     }
@@ -1421,13 +1421,13 @@ Tensor Context::new_i32(std::initializer_list<int32_t> values) {
     return wrap(tensor);
 }
 
-Tensor Context::new_i32(int32_t value) {
+Tensor Context::new_i32(int32_t value) const {
     auto * tensor = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, 1);
     *static_cast<int32_t *>(tensor->data) = value;
     return wrap(tensor);
 }
 
-BackendBuffer Context::allocate_tensors(const Backend & backend) {
+BackendBuffer Context::allocate_tensors(const Backend & backend) const {
     if (!backend.defined()) {
         throw std::invalid_argument("cannot allocate tensors without a valid backend");
     }
@@ -1438,7 +1438,7 @@ BackendBuffer Context::allocate_tensors(const Backend & backend) {
     return BackendBuffer(buffer);
 }
 
-BackendBuffer Context::allocate_tensors(ggml_backend_buffer_type_t buffer_type) {
+BackendBuffer Context::allocate_tensors(ggml_backend_buffer_type_t buffer_type) const {
     if (!buffer_type) {
         throw std::invalid_argument("buffer type must be non-null");
     }
@@ -1451,22 +1451,11 @@ BackendBuffer Context::allocate_tensors(ggml_backend_buffer_type_t buffer_type) 
 
 namespace nn {
 
-Module::Module(std::shared_ptr<Context> ctx, const Config * config)
-    : ctx_(std::move(ctx)), config_(config) {
-    if (!ctx_) {
-        throw std::invalid_argument("ggml::torch::nn::Module requires a valid context");
+Module::Module(const Model * model)
+    : model_(model) {
+    if (!model_) {
+        throw std::invalid_argument("ggml::torch::nn::Module requires an owning model");
     }
-}
-
-const Config & Module::config() const {
-    if (!config_) {
-        throw std::logic_error("ggml::torch::nn::Module does not have an associated configuration");
-    }
-    return *config_;
-}
-
-void Module::set_config_reference(const Config & config) {
-    config_ = &config;
 }
 
 Tensor & Module::register_parameter(const std::string & name, const Tensor & tensor) {
@@ -1495,11 +1484,8 @@ std::shared_ptr<Module> Module::register_module(const std::string & name, std::s
     if (!module) {
         throw std::invalid_argument("cannot register null module");
     }
-    if (module->ctx().get() != ctx_.get()) {
-        throw std::invalid_argument("registered module must share the same ggml context");
-    }
-    if (config_ && !module->config_) {
-        module->config_ = config_;
+    if (module->model_ != model_) {
+        throw std::invalid_argument("registered module must belong to the same model instance");
     }
     modules_[name] = std::move(module);
     return modules_[name];
@@ -1562,21 +1548,20 @@ std::vector<Tensor> Module::buffers(bool recurse) const {
 
 } // namespace nn
 
-Linear::Linear(std::shared_ptr<Context> context,
-               const Config & config,
+Linear::Linear(const Model & model,
                int64_t in_features,
                int64_t out_features,
                bool bias,
                ggml_type type)
-    : Module(std::move(context), &config), in_features_(in_features), out_features_(out_features) {
+    : Module(&model), in_features_(in_features), out_features_(out_features) {
     if (in_features <= 0 || out_features <= 0) {
         throw std::invalid_argument("ggml::torch::Linear requires positive feature sizes");
     }
 
-    auto shared = ctx();
-    weight_ = register_parameter("weight", shared->new_tensor(type, {in_features, out_features}));
+    const Context * ctx = model.ctx();
+    weight_ = register_parameter("weight", ctx->new_tensor(type, {in_features, out_features}));
     if (bias) {
-        bias_ = register_parameter("bias", shared->new_tensor(type, {out_features}));
+        bias_ = register_parameter("bias", ctx->new_tensor(type, {out_features}));
     }
 }
 
@@ -1584,7 +1569,7 @@ Tensor Linear::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::Linear::forward requires a defined input tensor");
     }
-    if (&input.context() != ctx().get()) {
+    if (&input.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::Linear::forward expects the input tensor to originate from the same context");
     }
 
@@ -1595,11 +1580,10 @@ Tensor Linear::forward(const Tensor & input) {
     return output;
 }
 
-RotaryEmbedding::RotaryEmbedding(std::shared_ptr<Context> context,
-                                 const Config & config,
+RotaryEmbedding::RotaryEmbedding(const Model & model,
                                  int64_t dims,
                                  Tensor::RopeConfig rope_config)
-    : Module(std::move(context), &config), dims_(dims), config_(rope_config) {
+    : Module(&model), dims_(dims), config_(rope_config) {
     if (dims_ <= 0) {
         throw std::invalid_argument("ggml::torch::RotaryEmbedding requires a positive dimension");
     }
@@ -1612,7 +1596,7 @@ Tensor RotaryEmbedding::forward(const Tensor & positions) {
     if (!positions.defined()) {
         throw std::invalid_argument("ggml::torch::RotaryEmbedding::forward expects defined position indices");
     }
-    if (&positions.context() != ctx().get()) {
+    if (&positions.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::RotaryEmbedding::forward expects positions from the same context");
     }
     // The rotary embedding does not modify the position tensor directly; users should
@@ -1634,10 +1618,10 @@ std::pair<Tensor, Tensor> RotaryEmbedding::apply(const Tensor & query,
     if (!query.defined() || !key.defined()) {
         throw std::invalid_argument("ggml::torch::RotaryEmbedding::apply requires defined query and key tensors");
     }
-    if (&query.context() != ctx().get() || &key.context() != ctx().get()) {
+    if (&query.context() != model().ctx() || &key.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::RotaryEmbedding::apply expects tensors from the same context");
     }
-    if (&positions.context() != ctx().get()) {
+    if (&positions.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::RotaryEmbedding::apply expects positions from the same context");
     }
     Tensor rotated_query = query.rope(positions, config_, freq_factors);
@@ -1645,37 +1629,36 @@ std::pair<Tensor, Tensor> RotaryEmbedding::apply(const Tensor & query,
     return {rotated_query, rotated_key};
 }
 
-Embedding::Embedding(std::shared_ptr<Context> context,
-                     const Config & config,
+Embedding::Embedding(const Model & model,
                      int64_t num_embeddings,
                      int64_t embedding_dim,
                      ggml_type type)
-    : Module(std::move(context), &config), num_embeddings_(num_embeddings), embedding_dim_(embedding_dim) {
+    : Module(&model), num_embeddings_(num_embeddings), embedding_dim_(embedding_dim) {
     if (num_embeddings <= 0 || embedding_dim <= 0) {
         throw std::invalid_argument("ggml::torch::Embedding requires positive dimensions");
     }
 
-    weight_ = register_parameter("weight", this->ctx()->new_tensor(type, {embedding_dim, num_embeddings}));
+    const Context * ctx = model.ctx();
+    weight_ = register_parameter("weight", ctx->new_tensor(type, {embedding_dim, num_embeddings}));
 }
 
 Tensor Embedding::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::Embedding::forward requires defined indices");
     }
-    if (&input.context() != ctx().get()) {
+    if (&input.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::Embedding::forward expects indices allocated from the same context");
     }
 
     return weight_.index_select(input);
 }
 
-LayerNorm::LayerNorm(std::shared_ptr<Context> context,
-                     const Config & config,
+LayerNorm::LayerNorm(const Model & model,
                      std::vector<int64_t> normalized_shape,
                      float eps,
                      bool elementwise_affine,
                      ggml_type type)
-    : Module(std::move(context), &config),
+    : Module(&model),
       normalized_shape_(std::move(normalized_shape)),
       eps_(eps),
       elementwise_affine_(elementwise_affine) {
@@ -1684,8 +1667,9 @@ LayerNorm::LayerNorm(std::shared_ptr<Context> context,
     }
 
     if (elementwise_affine_) {
-        weight_ = register_parameter("weight", this->ctx()->new_tensor(type, normalized_shape_));
-        bias_   = register_parameter("bias",   this->ctx()->new_tensor(type, normalized_shape_));
+        const Context * ctx = model.ctx();
+        weight_ = register_parameter("weight", ctx->new_tensor(type, normalized_shape_));
+        bias_   = register_parameter("bias",   ctx->new_tensor(type, normalized_shape_));
     }
 }
 
@@ -1693,7 +1677,7 @@ Tensor LayerNorm::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::LayerNorm::forward requires a defined input tensor");
     }
-    if (&input.context() != ctx().get()) {
+    if (&input.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::LayerNorm::forward expects the input tensor to originate from the same context");
     }
 
@@ -1707,24 +1691,24 @@ Tensor LayerNorm::forward(const Tensor & input) {
     return result;
 }
 
-RMSNorm::RMSNorm(std::shared_ptr<Context> context,
-                 const Config & config,
+RMSNorm::RMSNorm(const Model & model,
                  int64_t normalized_shape,
                  float eps,
                  ggml_type type)
-    : Module(std::move(context), &config), eps_(eps) {
+    : Module(&model), eps_(eps) {
     if (normalized_shape <= 0) {
         throw std::invalid_argument("ggml::torch::RMSNorm requires a positive normalized_shape");
     }
 
-    weight_ = register_parameter("weight", this->ctx()->new_tensor(type, {normalized_shape}));
+    const Context * ctx = model.ctx();
+    weight_ = register_parameter("weight", ctx->new_tensor(type, {normalized_shape}));
 }
 
 Tensor RMSNorm::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::RMSNorm::forward requires a defined input tensor");
     }
-    if (&input.context() != ctx().get()) {
+    if (&input.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::RMSNorm::forward expects the input tensor to originate from the same context");
     }
 
@@ -1732,78 +1716,78 @@ Tensor RMSNorm::forward(const Tensor & input) {
     return result.mul(weight_.repeat_like(result));
 }
 
-ReLU::ReLU(std::shared_ptr<Context> context, const Config & config)
-    : Module(std::move(context), &config) {
+ReLU::ReLU(const Model & model)
+    : Module(&model) {
 }
 
 Tensor ReLU::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::ReLU::forward requires a defined input tensor");
     }
-    if (&input.context() != ctx().get()) {
+    if (&input.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::ReLU::forward expects the input tensor to originate from the same context");
     }
     return input.relu();
 }
 
-SiLU::SiLU(std::shared_ptr<Context> context, const Config & config)
-    : Module(std::move(context), &config) {
+SiLU::SiLU(const Model & model)
+    : Module(&model) {
 }
 
 Tensor SiLU::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::SiLU::forward requires a defined input tensor");
     }
-    if (&input.context() != ctx().get()) {
+    if (&input.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::SiLU::forward expects the input tensor to originate from the same context");
     }
     return input.silu();
 }
 
-GELU::GELU(std::shared_ptr<Context> context, const Config & config, bool approximate)
-    : Module(std::move(context), &config), approximate_(approximate) {
+GELU::GELU(const Model & model, bool approximate)
+    : Module(&model), approximate_(approximate) {
 }
 
 Tensor GELU::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::GELU::forward requires a defined input tensor");
     }
-    if (&input.context() != ctx().get()) {
+    if (&input.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::GELU::forward expects the input tensor to originate from the same context");
     }
     return input.gelu(approximate_);
 }
 
-Sigmoid::Sigmoid(std::shared_ptr<Context> context, const Config & config)
-    : Module(std::move(context), &config) {
+Sigmoid::Sigmoid(const Model & model)
+    : Module(&model) {
 }
 
 Tensor Sigmoid::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::Sigmoid::forward requires a defined input tensor");
     }
-    if (&input.context() != ctx().get()) {
+    if (&input.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::Sigmoid::forward expects the input tensor to originate from the same context");
     }
     return input.sigmoid();
 }
 
-Tanh::Tanh(std::shared_ptr<Context> context, const Config & config)
-    : Module(std::move(context), &config) {
+Tanh::Tanh(const Model & model)
+    : Module(&model) {
 }
 
 Tensor Tanh::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::Tanh::forward requires a defined input tensor");
     }
-    if (&input.context() != ctx().get()) {
+    if (&input.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::Tanh::forward expects the input tensor to originate from the same context");
     }
     return input.tanh();
 }
 
-ELU::ELU(std::shared_ptr<Context> context, const Config & config, float alpha)
-    : Module(std::move(context), &config), alpha_(alpha) {
+ELU::ELU(const Model & model, float alpha)
+    : Module(&model), alpha_(alpha) {
     if (!std::isfinite(alpha_)) {
         throw std::invalid_argument("ggml::torch::ELU requires a finite alpha value");
     }
@@ -1816,14 +1800,14 @@ Tensor ELU::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::ELU::forward requires a defined input tensor");
     }
-    if (&input.context() != ctx().get()) {
+    if (&input.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::ELU::forward expects the input tensor to originate from the same context");
     }
     return input.elu();
 }
 
-LeakyReLU::LeakyReLU(std::shared_ptr<Context> context, const Config & config, float negative_slope)
-    : Module(std::move(context), &config), negative_slope_(negative_slope) {
+LeakyReLU::LeakyReLU(const Model & model, float negative_slope)
+    : Module(&model), negative_slope_(negative_slope) {
     if (!std::isfinite(negative_slope_)) {
         throw std::invalid_argument("ggml::torch::LeakyReLU requires a finite negative slope");
     }
@@ -1833,21 +1817,21 @@ Tensor LeakyReLU::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::LeakyReLU::forward requires a defined input tensor");
     }
-    if (&input.context() != ctx().get()) {
+    if (&input.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::LeakyReLU::forward expects the input tensor to originate from the same context");
     }
     return input.leaky_relu(negative_slope_);
 }
 
-Softmax::Softmax(std::shared_ptr<Context> context, const Config & config, int64_t dim)
-    : Module(std::move(context), &config), dim_(dim) {
+Softmax::Softmax(const Model & model, int64_t dim)
+    : Module(&model), dim_(dim) {
 }
 
 Tensor Softmax::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::Softmax::forward requires a defined input tensor");
     }
-    if (&input.context() != ctx().get()) {
+    if (&input.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::Softmax::forward expects the input tensor to originate from the same context");
     }
 
@@ -1860,25 +1844,23 @@ Tensor Softmax::forward(const Tensor & input) {
     return input.softmax(axis);
 }
 
-FeedForward::FeedForward(std::shared_ptr<Context> context,
-                         const Config & config,
+FeedForward::FeedForward(const Model & model,
                          int64_t embed_dim,
                          int64_t hidden_dim,
                          bool gated,
                          ggml_type type)
-    : Module(std::move(context), &config), gated_(gated) {
+    : Module(&model), gated_(gated) {
     if (embed_dim <= 0 || hidden_dim <= 0) {
         throw std::invalid_argument("ggml::torch::FeedForward requires positive dimensions");
     }
 
-    auto shared = ctx();
-    up_proj_   = std::make_shared<Linear>(shared, this->config(), embed_dim, hidden_dim, true, type);
-    down_proj_ = std::make_shared<Linear>(shared, this->config(), hidden_dim, embed_dim, true, type);
+    up_proj_   = std::make_shared<Linear>(model, embed_dim, hidden_dim, true, type);
+    down_proj_ = std::make_shared<Linear>(model, hidden_dim, embed_dim, true, type);
     register_module("up_proj", up_proj_);
     register_module("down_proj", down_proj_);
 
     if (gated_) {
-        gate_proj_ = std::make_shared<Linear>(shared, this->config(), embed_dim, hidden_dim, true, type);
+        gate_proj_ = std::make_shared<Linear>(model, embed_dim, hidden_dim, true, type);
         register_module("gate_proj", gate_proj_);
     }
 }
@@ -1887,7 +1869,7 @@ Tensor FeedForward::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::FeedForward::forward expects defined inputs");
     }
-    if (&input.context() != ctx().get()) {
+    if (&input.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::FeedForward::forward expects inputs from the same context");
     }
 
@@ -1901,14 +1883,13 @@ Tensor FeedForward::forward(const Tensor & input) {
     return down_proj_->forward(hidden);
 }
 
-MultiheadAttention::MultiheadAttention(std::shared_ptr<Context> context,
-                                       const Config & config,
+MultiheadAttention::MultiheadAttention(const Model & model,
                                        int64_t embed_dim,
                                        int64_t num_heads,
                                        bool bias,
                                        ggml_type type,
                                        Tensor::RopeConfig rope)
-    : Module(std::move(context), &config),
+    : Module(&model),
       embed_dim_(embed_dim),
       num_heads_(num_heads),
       rope_(rope) {
@@ -1924,11 +1905,10 @@ MultiheadAttention::MultiheadAttention(std::shared_ptr<Context> context,
         rope_.n_dims = static_cast<int>(head_dim_);
     }
 
-    auto shared = ctx();
-    q_proj_ = std::make_shared<Linear>(shared, this->config(), embed_dim_, embed_dim_, bias, type);
-    k_proj_ = std::make_shared<Linear>(shared, this->config(), embed_dim_, embed_dim_, bias, type);
-    v_proj_ = std::make_shared<Linear>(shared, this->config(), embed_dim_, embed_dim_, bias, type);
-    o_proj_ = std::make_shared<Linear>(shared, this->config(), embed_dim_, embed_dim_, bias, type);
+    q_proj_ = std::make_shared<Linear>(model, embed_dim_, embed_dim_, bias, type);
+    k_proj_ = std::make_shared<Linear>(model, embed_dim_, embed_dim_, bias, type);
+    v_proj_ = std::make_shared<Linear>(model, embed_dim_, embed_dim_, bias, type);
+    o_proj_ = std::make_shared<Linear>(model, embed_dim_, embed_dim_, bias, type);
 
     register_module("q_proj", q_proj_);
     register_module("k_proj", k_proj_);
@@ -1940,16 +1920,16 @@ Tensor MultiheadAttention::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::MultiheadAttention::forward expects defined input");
     }
-    if (&input.context() != ctx().get()) {
+    if (&input.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::MultiheadAttention::forward expects input from the same context");
     }
-    if (attention_mask_.defined() && &attention_mask_.context() != ctx().get()) {
+    if (attention_mask_.defined() && &attention_mask_.context() != model().ctx()) {
         throw std::invalid_argument("attention mask must originate from the same context");
     }
-    if (position_ids_.defined() && &position_ids_.context() != ctx().get()) {
+    if (position_ids_.defined() && &position_ids_.context() != model().ctx()) {
         throw std::invalid_argument("position ids must originate from the same context");
     }
-    if (freq_factors_.defined() && &freq_factors_.context() != ctx().get()) {
+    if (freq_factors_.defined() && &freq_factors_.context() != model().ctx()) {
         throw std::invalid_argument("frequency factors must originate from the same context");
     }
 
@@ -1988,14 +1968,13 @@ Tensor MultiheadAttention::forward(const Tensor & input) {
     return output;
 }
 
-Sequential::Sequential(std::shared_ptr<Context> context, const Config & config)
-    : Module(std::move(context), &config) {
+Sequential::Sequential(const Model & model)
+    : Module(&model) {
 }
 
-Sequential::Sequential(std::shared_ptr<Context> context,
-                       const Config & config,
+Sequential::Sequential(const Model & model,
                        std::initializer_list<std::shared_ptr<Module>> modules)
-    : Sequential(std::move(context), config) {
+    : Sequential(model) {
     size_t index = 0;
     for (auto module : modules) {
         append(std::to_string(index++), std::move(module));
@@ -2006,7 +1985,7 @@ Tensor Sequential::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::Sequential::forward requires a defined input tensor");
     }
-    if (&input.context() != ctx().get()) {
+    if (&input.context() != model().ctx()) {
         throw std::invalid_argument("ggml::torch::Sequential::forward expects the input tensor to originate from the same context");
     }
 
@@ -2029,10 +2008,36 @@ Sequential & Sequential::append(std::shared_ptr<Module> module) {
     return append(name, std::move(module));
 }
 
-Model::Model(std::shared_ptr<Context> context, ConfigMap config)
-    : nn::Module(std::move(context)),
+Model::Model(std::shared_ptr<Context> context, Config config)
+    : context_(std::move(context)),
       config_(std::move(config)) {
-    set_config_reference(config_);
+    if (!context_) {
+        throw std::invalid_argument("ggml::torch::Model requires a valid context");
+    }
+}
+
+const Config * Model::config() const {
+    return std::addressof(config_);
+}
+
+const Context * Model::ctx() const {
+    return context_.get();
+}
+
+std::shared_ptr<Context> Model::shared_context() const {
+    return context_;
+}
+
+std::vector<Tensor> Model::parameters(bool recurse) const {
+    return module().parameters(recurse);
+}
+
+std::vector<std::pair<std::string, Tensor>> Model::named_parameters(bool recurse) const {
+    return module().named_parameters(recurse);
+}
+
+std::vector<Tensor> Model::buffers(bool recurse) const {
+    return module().buffers(recurse);
 }
 
 Generator::Generator(std::shared_ptr<Model> model, std::vector<BackendBuffer> parameter_buffers)
@@ -2238,10 +2243,7 @@ std::vector<int> Generator::generate(std::vector<int> prompt, int n) {
         throw std::invalid_argument("number of tokens to generate must be non-negative");
     }
 
-    auto shared_ctx = model_->ctx();
-    if (!shared_ctx) {
-        throw std::runtime_error("model context is not initialised");
-    }
+    const Context * ctx = model_->ctx();
 
     std::vector<int> tokens = std::move(prompt);
     if (n == 0) {
@@ -2261,14 +2263,14 @@ std::vector<int> Generator::generate(std::vector<int> prompt, int n) {
     tokens.reserve(tokens.size() + static_cast<size_t>(n));
 
     for (int generated = 0; generated < n; ++generated) {
-        Tensor input_tokens = shared_ctx->new_tensor(GGML_TYPE_I32, {static_cast<int64_t>(tokens.size())});
+        Tensor input_tokens = ctx->new_tensor(GGML_TYPE_I32, {static_cast<int64_t>(tokens.size())});
         ggml_set_input(input_tokens.raw());
 
         Tensor logits = model_->forward(input_tokens);
         if (!logits.defined()) {
             throw std::runtime_error("model forward pass produced an undefined tensor");
         }
-        if (&logits.context() != shared_ctx.get()) {
+        if (&logits.context() != ctx) {
             throw std::runtime_error("model forward pass returned a tensor from a different context");
         }
         if (logits.raw()->type != GGML_TYPE_F32) {
@@ -2276,7 +2278,7 @@ std::vector<int> Generator::generate(std::vector<int> prompt, int n) {
         }
         ggml_set_output(logits.raw());
 
-        struct ggml_cgraph * graph = ggml_new_graph_custom(shared_ctx->raw(), GGML_DEFAULT_GRAPH_SIZE, false);
+        struct ggml_cgraph * graph = ggml_new_graph_custom(ctx->raw(), GGML_DEFAULT_GRAPH_SIZE, false);
         if (!graph) {
             throw std::runtime_error("failed to allocate computation graph");
         }
