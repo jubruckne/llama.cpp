@@ -2004,8 +2004,49 @@ Sequential & Sequential::append(std::shared_ptr<Module> module) {
     return append(name, std::move(module));
 }
 
-Model::Model(std::shared_ptr<Context> context, Config config)
-    : context_(std::move(context)),
+namespace {
+
+size_t count_tensor_infos(const Config & config) {
+    size_t count = 0;
+    for (const auto & value : config.values()) {
+        if (value.is<TensorInfo>()) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+ggml_init_params default_context_params_from_config(const Config & config) {
+    const size_t tensor_count = count_tensor_infos(config);
+    constexpr size_t extra_tensors = 64;
+    const size_t graph_nodes = std::max<size_t>(GGML_DEFAULT_GRAPH_SIZE, tensor_count);
+
+    size_t total_tensors = tensor_count;
+    total_tensors += graph_nodes;
+    total_tensors += extra_tensors;
+
+    const size_t tensor_overhead = ggml_tensor_overhead();
+    if (tensor_overhead != 0 && total_tensors > std::numeric_limits<size_t>::max() / tensor_overhead) {
+        throw std::runtime_error("tensor metadata allocation exceeds size limits");
+    }
+
+    size_t metadata_bytes = tensor_overhead * total_tensors;
+    size_t graph_bytes    = ggml_graph_overhead_custom(graph_nodes, false);
+    if (graph_bytes > std::numeric_limits<size_t>::max() - metadata_bytes) {
+        throw std::runtime_error("graph metadata allocation exceeds size limits");
+    }
+
+    ggml_init_params init{};
+    init.mem_size   = metadata_bytes + graph_bytes;
+    init.mem_buffer = nullptr;
+    init.no_alloc   = true;
+    return init;
+}
+
+} // namespace
+
+Model::Model(Config config)
+    : context_(Context::create(default_context_params_from_config(config))),
       config_(std::move(config)) {
     if (!context_) {
         throw std::invalid_argument("ggml::torch::Model requires a valid context");
@@ -2332,9 +2373,10 @@ std::vector<int> Generator::generate(std::vector<int> prompt, int n) {
 
 
 Config Loader::load_config_from_gguf(const std::string & path) {
+    ggml_context * tensor_metadata = nullptr;
     struct gguf_init_params params {
         /*.no_alloc =*/ true,
-        /*.ctx      =*/ nullptr,
+        /*.ctx      =*/ &tensor_metadata,
     };
 
     std::unique_ptr<gguf_context, decltype(&gguf_free)> ctx(gguf_init_from_file(path.c_str(), params), gguf_free);
@@ -2342,13 +2384,27 @@ Config Loader::load_config_from_gguf(const std::string & path) {
         throw std::runtime_error("failed to open GGUF file for configuration loading");
     }
 
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> metadata_ctx(tensor_metadata, ggml_free);
+
     const int64_t n_kv_raw = gguf_get_n_kv(ctx.get());
     if (n_kv_raw < 0) {
         throw std::runtime_error("GGUF file reported a negative configuration count");
     }
 
+    const int64_t tensor_count_raw = gguf_get_n_tensors(ctx.get());
+    if (tensor_count_raw < 0) {
+        throw std::runtime_error("GGUF file reported a negative tensor count");
+    }
+
+    const size_t tensor_count = static_cast<size_t>(tensor_count_raw);
+
+    size_t reserve_size = static_cast<size_t>(n_kv_raw);
+    if (tensor_count > std::numeric_limits<size_t>::max() - reserve_size) {
+        throw std::runtime_error("GGUF file contains too many configuration entries");
+    }
+
     std::vector<Value> values;
-    values.reserve(static_cast<size_t>(n_kv_raw));
+    values.reserve(reserve_size + tensor_count);
 
     for (int64_t i = 0; i < n_kv_raw; ++i) {
         const std::string key = gguf_get_key(ctx.get(), i);
@@ -2447,6 +2503,32 @@ Config Loader::load_config_from_gguf(const std::string & path) {
             default:
                 throw std::runtime_error("unsupported GGUF value type in configuration");
         }
+    }
+
+    if (tensor_count_raw > 0 && !metadata_ctx) {
+        throw std::runtime_error("failed to load tensor metadata from GGUF file");
+    }
+
+    for (int64_t i = 0; i < tensor_count_raw; ++i) {
+        const char * tensor_name = gguf_get_tensor_name(ctx.get(), i);
+        if (!tensor_name) {
+            throw std::runtime_error("encountered tensor without a name in GGUF file");
+        }
+
+        ggml_tensor * tensor_meta = ggml_get_tensor(metadata_ctx.get(), tensor_name);
+        if (!tensor_meta) {
+            throw std::runtime_error("tensor '" + std::string(tensor_name) + "' metadata not found in GGUF context");
+        }
+
+        std::string tensor_name_str(tensor_name);
+        TensorInfo tensor_info{};
+        tensor_info.name = tensor_name_str;
+        tensor_info.type = tensor_meta->type;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            tensor_info.shape[d] = tensor_meta->ne[d];
+        }
+
+        values.emplace_back("tensor." + tensor_name_str, std::move(tensor_info));
     }
 
     return Config(std::move(values));
@@ -2570,53 +2652,6 @@ std::vector<BackendBuffer> Loader::load_weights_from_gguf(Model & model,
     }
 
     return parameter_buffers;
-}
-
-std::shared_ptr<Context> Loader::create_context_for_file(const std::string & gguf_path) {
-    ggml_init_params params = default_context_params_from_file(gguf_path);
-    return Context::create(params);
-}
-
-struct ggml_init_params Loader::default_context_params_from_file(const std::string & gguf_path) {
-    struct gguf_init_params params {
-        /*.no_alloc =*/ true,
-        /*.ctx      =*/ nullptr,
-    };
-
-    std::unique_ptr<gguf_context, decltype(&gguf_free)> ctx(gguf_init_from_file(gguf_path.c_str(), params), gguf_free);
-    if (!ctx) {
-        throw std::runtime_error("failed to open GGUF file for model loading");
-    }
-
-    const int64_t tensor_count_raw = gguf_get_n_tensors(ctx.get());
-    if (tensor_count_raw < 0) {
-        throw std::runtime_error("GGUF file reported a negative tensor count");
-    }
-
-    const size_t tensor_count = static_cast<size_t>(tensor_count_raw);
-    constexpr size_t extra_tensors = 64;
-    const size_t graph_nodes = std::max<size_t>(GGML_DEFAULT_GRAPH_SIZE, tensor_count);
-
-    size_t total_tensors = tensor_count;
-    total_tensors += graph_nodes;
-    total_tensors += extra_tensors;
-
-    const size_t tensor_overhead = ggml_tensor_overhead();
-    if (tensor_overhead != 0 && total_tensors > std::numeric_limits<size_t>::max() / tensor_overhead) {
-        throw std::runtime_error("tensor metadata allocation exceeds size limits");
-    }
-
-    size_t metadata_bytes = tensor_overhead * total_tensors;
-    size_t graph_bytes    = ggml_graph_overhead_custom(graph_nodes, false);
-    if (graph_bytes > std::numeric_limits<size_t>::max() - metadata_bytes) {
-        throw std::runtime_error("graph metadata allocation exceeds size limits");
-    }
-
-    ggml_init_params init{};
-    init.mem_size   = metadata_bytes + graph_bytes;
-    init.mem_buffer = nullptr;
-    init.no_alloc   = true;
-    return init;
 }
 
 } // namespace ggml::torch
