@@ -12,6 +12,7 @@
 #include <initializer_list>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -31,6 +32,10 @@ class Config;
 
 class BackendScheduler;
 class Model;
+
+using Shape = std::array<int64_t, GGML_MAX_DIMS>;
+
+std::string qualify_name(std::string_view base, std::string_view name);
 
 template <typename T>
 concept KeyPartConcept =
@@ -304,7 +309,7 @@ namespace nn {
 
 class Module : public std::enable_shared_from_this<Module> {
 public:
-    explicit Module(const Model * model);
+    explicit Module(const Model * model, std::string name);
     virtual ~Module() = default;
 
     Module(const Module &) = delete;
@@ -314,37 +319,69 @@ public:
 
     virtual Tensor forward(const Tensor & input) = 0;
 
-    Tensor & register_parameter(const std::string & name, const Tensor & tensor);
-    Tensor & register_buffer(const std::string & name, const Tensor & tensor);
-    std::shared_ptr<Module> register_module(const std::string & name, std::shared_ptr<Module> module);
+    Tensor & register_parameter(const std::string & name,
+                                std::optional<Shape> shape = {},
+                                std::optional<ggml_type> type = {});
+    Tensor & register_buffer(const std::string & name, Shape shape, ggml_type type);
 
-    std::vector<Tensor> parameters(bool recurse = true) const;
-    std::vector<std::pair<std::string, Tensor>> named_parameters(bool recurse = true) const;
-
-    std::vector<Tensor> buffers(bool recurse = true) const;
+    template <typename TModule, typename... Args>
+    std::shared_ptr<TModule> register_module(const std::string & name, Args &&... args);
 
 protected:
-    using ParameterMap = std::map<std::string, Tensor>;
-    using ModuleMap    = std::map<std::string, std::shared_ptr<Module>>;
+    const std::map<std::string, std::shared_ptr<Module>> & modules() const { return modules_; }
 
-    const ParameterMap & parameters_map() const { return parameters_; }
-    const ParameterMap & buffers_map() const { return buffers_; }
-    const ModuleMap    & modules_map() const { return modules_; }
-
-    const Model & model() const { return *model_; }
+    Model       & model();
+    const Model & model() const;
+    const std::string & name() const noexcept { return name_; }
 
 private:
+    friend class ggml::torch::Model;
+
     const Model * model_ = nullptr;
-    ParameterMap parameters_;
-    ParameterMap buffers_;
-    ModuleMap modules_;
+    std::map<std::string, std::shared_ptr<Module>> modules_;
+    std::string name_;
 };
+
+template <typename TModule, typename... Args>
+std::shared_ptr<TModule> Module::register_module(const std::string & name, Args &&... args) {
+    if (!model_) {
+        throw std::runtime_error("cannot register submodule without an owning model");
+    }
+    if (name.empty()) {
+        throw std::invalid_argument("module name must be non-empty");
+    }
+
+    const std::string qualified = qualify_name(name_, name);
+    std::shared_ptr<TModule> module;
+
+    if constexpr (std::is_constructible_v<TModule, Model &, std::string, Args...>) {
+        module = std::make_shared<TModule>(model(), qualified, std::forward<Args>(args)...);
+    } else if constexpr (std::is_constructible_v<TModule, Model *, std::string, Args...>) {
+        module = std::make_shared<TModule>(&model(), qualified, std::forward<Args>(args)...);
+    } else {
+        static_assert(std::is_constructible_v<TModule, Model &, std::string, Args...> ||
+                          std::is_constructible_v<TModule, Model *, std::string, Args...>,
+                      "register_module requires TModule to be constructible with Model& or Model* and a name");
+    }
+
+    auto insertion = modules_.emplace(name, module);
+    if (!insertion.second) {
+        throw std::invalid_argument("module '" + qualified + "' is already registered");
+    }
+    return module;
+}
 
 } // namespace nn
 
 class Linear : public nn::Module {
 public:
-    Linear(const Model & model,
+    Linear(Model & model,
+           int64_t in_features,
+           int64_t out_features,
+           bool bias = true,
+           ggml_type type = GGML_TYPE_F32);
+    Linear(Model & model,
+           std::string name,
            int64_t in_features,
            int64_t out_features,
            bool bias = true,
@@ -366,7 +403,11 @@ private:
 
 class RotaryEmbedding : public nn::Module {
 public:
-    RotaryEmbedding(const Model & model,
+    RotaryEmbedding(Model & model,
+                    int64_t dims,
+                    Tensor::RopeConfig rope_config = {});
+    RotaryEmbedding(Model & model,
+                    std::string name,
                     int64_t dims,
                     Tensor::RopeConfig rope_config = {});
 
@@ -389,7 +430,13 @@ private:
 
 class FeedForward : public nn::Module {
 public:
-    FeedForward(const Model & model,
+    FeedForward(Model & model,
+                int64_t embed_dim,
+                int64_t hidden_dim,
+                bool gated = true,
+                ggml_type type = GGML_TYPE_F32);
+    FeedForward(Model & model,
+                std::string name,
                 int64_t embed_dim,
                 int64_t hidden_dim,
                 bool gated = true,
@@ -410,7 +457,14 @@ private:
 
 class MultiheadAttention : public nn::Module {
 public:
-    MultiheadAttention(const Model & model,
+    MultiheadAttention(Model & model,
+                       int64_t embed_dim,
+                       int64_t num_heads,
+                       bool bias = true,
+                       ggml_type type = GGML_TYPE_F32,
+                       Tensor::RopeConfig rope = {});
+    MultiheadAttention(Model & model,
+                       std::string name,
                        int64_t embed_dim,
                        int64_t num_heads,
                        bool bias = true,
@@ -446,7 +500,12 @@ private:
 
 class Embedding : public nn::Module {
 public:
-    Embedding(const Model & model,
+    Embedding(Model & model,
+              int64_t num_embeddings,
+              int64_t embedding_dim,
+              ggml_type type = GGML_TYPE_F32);
+    Embedding(Model & model,
+              std::string name,
               int64_t num_embeddings,
               int64_t embedding_dim,
               ggml_type type = GGML_TYPE_F32);
@@ -465,7 +524,13 @@ private:
 
 class LayerNorm : public nn::Module {
 public:
-    LayerNorm(const Model & model,
+    LayerNorm(Model & model,
+              std::vector<int64_t> normalized_shape,
+              float eps = 1e-5f,
+              bool elementwise_affine = true,
+              ggml_type type = GGML_TYPE_F32);
+    LayerNorm(Model & model,
+              std::string name,
               std::vector<int64_t> normalized_shape,
               float eps = 1e-5f,
               bool elementwise_affine = true,
@@ -487,7 +552,12 @@ private:
 
 class RMSNorm : public nn::Module {
 public:
-    RMSNorm(const Model & model,
+    RMSNorm(Model & model,
+            int64_t normalized_shape,
+            float eps = 1e-5f,
+            ggml_type type = GGML_TYPE_F32);
+    RMSNorm(Model & model,
+            std::string name,
             int64_t normalized_shape,
             float eps = 1e-5f,
             ggml_type type = GGML_TYPE_F32);
@@ -504,21 +574,27 @@ private:
 
 class ReLU : public nn::Module {
 public:
-    explicit ReLU(const Model & model);
+    using Module::Module;
+
+    explicit ReLU(Model & model, std::string name = "")
+        : Module(&model, std::move(name)) {}
 
     Tensor forward(const Tensor & input) override;
 };
 
 class SiLU : public nn::Module {
 public:
-    explicit SiLU(const Model & model);
+    using Module::Module;
+
+    explicit SiLU(Model & model, std::string name = "")
+        : Module(&model, std::move(name)) {}
 
     Tensor forward(const Tensor & input) override;
 };
 
 class GELU : public nn::Module {
 public:
-    GELU(const Model & model, bool approximate = true);
+    GELU(Model & model, std::string name = "", bool approximate = true);
 
     Tensor forward(const Tensor & input) override;
 
@@ -530,21 +606,27 @@ private:
 
 class Sigmoid : public nn::Module {
 public:
-    explicit Sigmoid(const Model & model);
+    using Module::Module;
+
+    explicit Sigmoid(Model & model, std::string name = "")
+        : Module(&model, std::move(name)) {}
 
     Tensor forward(const Tensor & input) override;
 };
 
 class Tanh : public nn::Module {
 public:
-    explicit Tanh(const Model & model);
+    using Module::Module;
+
+    explicit Tanh(Model & model, std::string name = "")
+        : Module(&model, std::move(name)) {}
 
     Tensor forward(const Tensor & input) override;
 };
 
 class ELU : public nn::Module {
 public:
-    ELU(const Model & model, float alpha = 1.0f);
+    ELU(Model & model, std::string name = "", float alpha = 1.0f);
 
     Tensor forward(const Tensor & input) override;
 
@@ -556,7 +638,7 @@ private:
 
 class LeakyReLU : public nn::Module {
 public:
-    LeakyReLU(const Model & model, float negative_slope = 0.01f);
+    LeakyReLU(Model & model, std::string name = "", float negative_slope = 0.01f);
 
     Tensor forward(const Tensor & input) override;
 
@@ -568,7 +650,7 @@ private:
 
 class Softmax : public nn::Module {
 public:
-    Softmax(const Model & model, int64_t dim = -1);
+    Softmax(Model & model, std::string name = "", int64_t dim = -1);
 
     Tensor forward(const Tensor & input) override;
 
@@ -580,22 +662,28 @@ private:
 
 class Sequential : public nn::Module {
 public:
-    explicit Sequential(const Model & model);
-    Sequential(const Model & model, std::initializer_list<std::shared_ptr<Module>> modules);
+    explicit Sequential(Model & model, std::string name = "");
 
     Tensor forward(const Tensor & input) override;
 
-    Sequential & append(const std::string & name, std::shared_ptr<Module> module);
-    Sequential & append(std::shared_ptr<Module> module);
+    template <typename TModule, typename... Args>
+    Sequential & append(const std::string & name, Args &&... args);
 
 private:
     std::vector<std::pair<std::string, std::shared_ptr<Module>>> ordered_modules_;
 };
 
+template <typename TModule, typename... Args>
+Sequential & Sequential::append(const std::string & name, Args &&... args) {
+    auto module = register_module<TModule>(name, std::forward<Args>(args)...);
+    ordered_modules_.emplace_back(name, std::move(module));
+    return *this;
+}
+
 struct TensorInfo {
     std::string name;
     ggml_type type = GGML_TYPE_F32;
-    std::array<int64_t, GGML_MAX_DIMS> shape{1, 1, 1, 1};
+    Shape shape{1, 1, 1, 1};
 };
 
 struct Value {
@@ -788,17 +876,29 @@ public:
     const Context * ctx() const;
     std::shared_ptr<Context> shared_context() const;
 
-    std::vector<Tensor> parameters(bool recurse = true) const;
-    std::vector<std::pair<std::string, Tensor>> named_parameters(bool recurse = true) const;
-    std::vector<Tensor> buffers(bool recurse = true) const;
+    const std::map<std::string, Tensor> & parameters() const;
+    const std::map<std::string, Tensor> & buffers() const;
+
+    Tensor & register_parameter(const std::string & name,
+                                std::optional<Shape> shape = {},
+                                std::optional<ggml_type> type = {});
+    Tensor & register_buffer(const std::string & name, Shape shape, ggml_type type);
 
 protected:
     virtual nn::Module & module() = 0;
     virtual const nn::Module & module() const = 0;
 
 private:
+    friend class nn::Module;
+
+    using TensorMap = std::map<std::string, Tensor>;
+
+    static std::vector<int64_t> shape_to_dims(const Shape & shape);
+
     std::shared_ptr<Context> context_;
     Config config_{};
+    TensorMap parameters_;
+    TensorMap buffers_;
 };
 
 class Loader;
