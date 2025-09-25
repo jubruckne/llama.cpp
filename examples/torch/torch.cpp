@@ -150,15 +150,19 @@ Shape::Shape()
 }
 
 Shape::Shape(std::initializer_list<int64_t> dims)
-    : Shape(dims.begin(), dims.end()) {
+    : Shape(std::span<const int64_t>(dims.begin(), dims.size())) {
 }
 
 Shape::Shape(const std::vector<int64_t> & dims)
+    : Shape(std::span<const int64_t>(dims)) {
+}
+
+Shape::Shape(std::span<const int64_t> dims)
     : Shape(dims.begin(), dims.end()) {
 }
 
 Shape::Shape(const int64_t * data, size_t dims)
-    : Shape(data, data + dims) {
+    : Shape(std::span<const int64_t>(data, dims)) {
 }
 
 Shape Shape::scalar() {
@@ -178,11 +182,11 @@ int64_t Shape::size(size_t dim) const {
     if (dim >= ndims) {
         throw std::out_of_range("shape dimension index out of range");
     }
-    return storage_at(decode_storage_index(index_))[dim];
+    return storage_ref()[dim];
 }
 
 int64_t Shape::numel() const {
-    const auto & values = storage_at(decode_storage_index(index_));
+    const auto & values = storage_ref();
     const size_t count  = dims();
     int64_t      total  = 1;
     for (size_t i = 0; i < count; ++i) {
@@ -200,7 +204,7 @@ int64_t Shape::operator[](size_t index) const {
     if (index >= dims()) {
         throw std::out_of_range("shape index out of range");
     }
-    return storage_at(decode_storage_index(index_))[index];
+    return storage_ref()[index];
 }
 
 int64_t Shape::flatten(std::span<const int64_t> indices) const {
@@ -213,7 +217,7 @@ int64_t Shape::flatten(std::span<const int64_t> indices) const {
         return 0;
     }
 
-    const auto & values = storage_at(decode_storage_index(index_));
+    const auto & values = storage_ref();
     int64_t      linear = 0;
     for (size_t i = 0; i < ndims; ++i) {
         const int64_t dim_size = values[i];
@@ -256,7 +260,7 @@ void Shape::unravel(int64_t index, std::span<int64_t> indices) const {
         throw std::out_of_range("linear index must be non-negative");
     }
 
-    const auto & values = storage_at(decode_storage_index(index_));
+    const auto & values = storage_ref();
     int64_t      linear = index;
     for (size_t i = ndims; i-- > 0;) {
         const int64_t dim_size = values[i];
@@ -270,13 +274,13 @@ void Shape::unravel(int64_t index, std::span<int64_t> indices) const {
 }
 
 Shape::operator std::vector<int64_t>() const {
-    const auto & values = storage_at(decode_storage_index(index_));
+    const auto & values = storage_ref();
     const size_t count  = dims();
     return std::vector<int64_t>(values.begin(), values.begin() + count);
 }
 
 Shape::operator std::array<int64_t, GGML_MAX_DIMS>() const {
-    return storage_at(decode_storage_index(index_));
+    return storage_ref();
 }
 
 uint16_t Shape::store(const std::array<int64_t, GGML_MAX_DIMS> & storage) {
@@ -290,7 +294,7 @@ uint16_t Shape::store(const std::array<int64_t, GGML_MAX_DIMS> & storage) {
         return it->second;
     }
 
-    if (entries.size() >= static_cast<size_t>(Shape::kIndexMask) + 1) {
+    if (entries.size() >= Shape::kMaxShapes) {
         throw std::overflow_error("too many unique shapes");
     }
 

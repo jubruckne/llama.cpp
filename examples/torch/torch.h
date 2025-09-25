@@ -39,6 +39,7 @@ public:
 
     Shape(std::initializer_list<int64_t> dims);
     explicit Shape(const std::vector<int64_t> & dims);
+    explicit Shape(std::span<const int64_t> dims);
 
     static Shape scalar();
     static Shape vector(int64_t n);
@@ -51,7 +52,7 @@ public:
 
     Shape(const int64_t * data, size_t dims);
 
-    const int64_t * data() const { return storage_at(decode_storage_index(index_)).data(); }
+    const int64_t * data() const { return storage_ref().data(); }
 
     size_t dims() const noexcept { return static_cast<size_t>(decode_dims(index_)); }
 
@@ -83,6 +84,9 @@ public:
 private:
     static constexpr uint16_t kDimsShift = 13;
     static constexpr uint16_t kIndexMask = (1u << kDimsShift) - 1;
+    static constexpr size_t   kMaxShapes = static_cast<size_t>(kIndexMask) + 1;
+
+    static_assert(GGML_MAX_DIMS <= (1u << (16 - kDimsShift)), "ggml::torch::Shape encoding does not support GGML_MAX_DIMS");
 
     static uint16_t store(const std::array<int64_t, GGML_MAX_DIMS> & storage);
     static const std::array<int64_t, GGML_MAX_DIMS> & storage_at(uint16_t index);
@@ -99,6 +103,9 @@ private:
     static constexpr uint8_t decode_dims(uint16_t encoded) noexcept {
         return static_cast<uint8_t>(encoded >> kDimsShift);
     }
+
+    uint16_t storage_index() const noexcept { return decode_storage_index(index_); }
+    const std::array<int64_t, GGML_MAX_DIMS> & storage_ref() const { return storage_at(storage_index()); }
 
     uint16_t index_ = 0;
 };
