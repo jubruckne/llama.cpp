@@ -592,6 +592,12 @@ private:
     std::vector<std::pair<std::string, std::shared_ptr<Module>>> ordered_modules_;
 };
 
+struct TensorInfo {
+    std::string name;
+    ggml_type type = GGML_TYPE_F32;
+    std::array<int64_t, GGML_MAX_DIMS> shape{1, 1, 1, 1};
+};
+
 struct Value {
     using Variant = std::variant<
         int8_t,
@@ -617,7 +623,8 @@ struct Value {
         std::vector<float>,
         std::vector<double>,
         std::vector<bool>,
-        std::vector<std::string>>;
+        std::vector<std::string>,
+        TensorInfo>;
 
     Value() = delete;
 
@@ -767,7 +774,7 @@ private:
 
 class Model {
 public:
-    Model(std::shared_ptr<Context> context, Config config);
+    explicit Model(Config config);
     virtual ~Model() = default;
 
     Model(const Model &) = delete;
@@ -882,9 +889,6 @@ public:
     static Config load_config_from_gguf(const std::string & gguf_path);
 
 private:
-    static std::shared_ptr<Context> create_context_for_file(const std::string & gguf_path);
-    static struct ggml_init_params default_context_params_from_file(const std::string & gguf_path);
-
     static std::vector<BackendBuffer>
     load_weights_from_gguf(Model & model, const std::string & gguf_path, BackendResolver & resolver);
 
@@ -898,9 +902,8 @@ private:
             throw std::invalid_argument("Loader::load_from_gguf requires a backend resolver");
         }
 
-        auto context = create_context_for_file(gguf_path);
         auto config  = load_config_from_gguf(gguf_path);
-        auto model   = std::make_shared<TModel>(std::move(context), std::move(config));
+        auto model   = std::make_shared<TModel>(std::move(config));
 
         std::shared_ptr<Model> base_model = model;
         auto parameter_buffers = load_weights_from_gguf(*base_model, gguf_path, resolver);
