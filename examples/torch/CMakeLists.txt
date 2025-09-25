@@ -20,4 +20,9 @@ target_include_directories(${TARGET} PRIVATE ${TORCH_EXAMPLE_INCLUDES})
 
 target_link_libraries(${TARGET} PRIVATE ggml Threads::Threads)
 
-target_compile_features(${TARGET} PRIVATE cxx_std_23)
+set_target_properties(${TARGET}
+    PROPERTIES
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+)
