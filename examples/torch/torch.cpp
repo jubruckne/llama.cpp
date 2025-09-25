@@ -219,6 +219,8 @@ int64_t Shape::flatten(std::span<const int64_t> indices) const {
 
     const auto & values = storage_ref();
     int64_t      linear = 0;
+    int64_t      stride = 1;
+
     for (size_t i = 0; i < ndims; ++i) {
         const int64_t dim_size = values[i];
         const int64_t index    = indices[i];
@@ -226,14 +228,28 @@ int64_t Shape::flatten(std::span<const int64_t> indices) const {
             throw std::out_of_range("index is out of bounds for shape dimension");
         }
 
-        if (dim_size > 0 && i > 0) {
-            if (linear > (std::numeric_limits<int64_t>::max() - index) / dim_size) {
+        if (index != 0) {
+            if (index > 0 && stride > std::numeric_limits<int64_t>::max() / index) {
                 throw std::overflow_error("flattened index exceeds int64_t range");
             }
+
+            const int64_t offset = index * stride;
+            if (offset > std::numeric_limits<int64_t>::max() - linear) {
+                throw std::overflow_error("flattened index exceeds int64_t range");
+            }
+
+            linear += offset;
         }
 
-        linear = linear * dim_size + index;
+        if (i + 1 < ndims) {
+            if (dim_size > 0 && stride > std::numeric_limits<int64_t>::max() / dim_size) {
+                throw std::overflow_error("flattened index exceeds int64_t range");
+            }
+
+            stride *= dim_size;
+        }
     }
+
     return linear;
 }
 
@@ -262,9 +278,13 @@ void Shape::unravel(int64_t index, std::span<int64_t> indices) const {
 
     const auto & values = storage_ref();
     int64_t      linear = index;
-    for (size_t i = ndims; i-- > 0;) {
+    for (size_t i = 0; i < ndims; ++i) {
         const int64_t dim_size = values[i];
-        indices[i]             = linear % dim_size;
+        if (dim_size <= 0) {
+            throw std::out_of_range("shape dimension must be positive to unravel");
+        }
+
+        indices[i] = linear % dim_size;
         linear /= dim_size;
     }
 
