@@ -8,10 +8,12 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <deque>
 #include <fstream>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -19,10 +21,53 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <span>
 
 namespace ggml::torch {
 
 namespace {
+
+struct ShapeStorageHash {
+    size_t operator()(const std::array<int64_t, GGML_MAX_DIMS> & storage) const noexcept {
+        size_t seed = 0;
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            const size_t value = std::hash<int64_t>{}(storage[i]);
+            seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+        }
+        return seed;
+    }
+};
+
+using ShapeStorageMap = std::unordered_map<std::array<int64_t, GGML_MAX_DIMS>, uint16_t, ShapeStorageHash>;
+
+std::mutex & shape_storage_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::array<int64_t, GGML_MAX_DIMS> make_scalar_storage() {
+    std::array<int64_t, GGML_MAX_DIMS> storage{};
+    storage.fill(1);
+    return storage;
+}
+
+std::deque<std::array<int64_t, GGML_MAX_DIMS>> & shape_storage_entries() {
+    static std::deque<std::array<int64_t, GGML_MAX_DIMS>> entries = [] {
+        std::deque<std::array<int64_t, GGML_MAX_DIMS>> result;
+        result.push_back(make_scalar_storage());
+        return result;
+    }();
+    return entries;
+}
+
+ShapeStorageMap & shape_storage_map() {
+    static ShapeStorageMap map = [] {
+        ShapeStorageMap result;
+        result.emplace(make_scalar_storage(), 0);
+        return result;
+    }();
+    return map;
+}
 
 [[noreturn]] void throw_bad_context() {
     throw std::runtime_error("ggml::torch tensor operations require tensors to share the same context");
@@ -38,22 +83,9 @@ std::shared_ptr<Context> assert_shared(Context * ctx) {
 
 template <typename It>
 ggml_tensor * new_tensor_from_range(ggml_context * ctx, ggml_type type, It begin, It end) {
-    const auto dims = std::distance(begin, end);
-    if (dims <= 0 || dims > GGML_MAX_DIMS) {
-        throw std::invalid_argument("ggml::torch::Context::new_tensor expects between 1 and 4 dimensions");
-    }
-
-    std::array<int64_t, GGML_MAX_DIMS> ne{};
-    int index = 0;
-    for (auto it = begin; it != end; ++it, ++index) {
-        const auto dim = *it;
-        if (dim <= 0) {
-            throw std::invalid_argument("ggml::torch::Context::new_tensor dimensions must be positive");
-        }
-        ne[index] = dim;
-    }
-
-    return ggml_new_tensor(ctx, type, static_cast<int>(dims), ne.data());
+    const Shape shape(begin, end);
+    const int   ndims = shape.is_scalar() ? 1 : static_cast<int>(shape.dims());
+    return ggml_new_tensor(ctx, type, ndims, shape.data());
 }
 
 int normalize_dim(int64_t dim, int64_t ndims) {
@@ -76,20 +108,6 @@ std::array<int, GGML_MAX_DIMS> identity_axes() {
         axes[i] = i;
     }
     return axes;
-}
-
-std::array<int64_t, GGML_MAX_DIMS> to_shape_array(const std::vector<int64_t> & shape) {
-    if (shape.empty() || shape.size() > GGML_MAX_DIMS) {
-        throw std::invalid_argument("reshape expects between 1 and 4 dimensions");
-    }
-    std::array<int64_t, GGML_MAX_DIMS> result{1, 1, 1, 1};
-    for (size_t i = 0; i < shape.size(); ++i) {
-        if (shape[i] <= 0) {
-            throw std::invalid_argument("tensor dimensions must be positive");
-        }
-        result[i] = shape[i];
-    }
-    return result;
 }
 
 int tensor_ndims(const ggml_tensor * tensor) {
@@ -126,6 +144,174 @@ std::vector<std::string> convert_string_array(const struct gguf_context * ctx, i
 }
 
 } // namespace
+
+Shape::Shape()
+    : index_(encode(0, 0)) {
+}
+
+Shape::Shape(std::initializer_list<int64_t> dims)
+    : Shape(dims.begin(), dims.end()) {
+}
+
+Shape::Shape(const std::vector<int64_t> & dims)
+    : Shape(dims.begin(), dims.end()) {
+}
+
+Shape::Shape(const int64_t * data, size_t dims)
+    : Shape(data, data + dims) {
+}
+
+Shape Shape::scalar() {
+    return Shape();
+}
+
+Shape Shape::vector(int64_t n) {
+    return Shape{n};
+}
+
+Shape Shape::matrix(int64_t rows, int64_t cols) {
+    return Shape{rows, cols};
+}
+
+int64_t Shape::size(size_t dim) const {
+    const size_t ndims = dims();
+    if (dim >= ndims) {
+        throw std::out_of_range("shape dimension index out of range");
+    }
+    return storage_at(decode_storage_index(index_))[dim];
+}
+
+int64_t Shape::numel() const {
+    const auto & values = storage_at(decode_storage_index(index_));
+    const size_t count  = dims();
+    int64_t      total  = 1;
+    for (size_t i = 0; i < count; ++i) {
+        const int64_t dim_size = values[i];
+        if (dim_size > 0 &&
+            total > std::numeric_limits<int64_t>::max() / dim_size) {
+            throw std::overflow_error("shape element count exceeds int64_t range");
+        }
+        total *= dim_size;
+    }
+    return total;
+}
+
+int64_t Shape::operator[](size_t index) const {
+    if (index >= dims()) {
+        throw std::out_of_range("shape index out of range");
+    }
+    return storage_at(decode_storage_index(index_))[index];
+}
+
+int64_t Shape::flatten(std::span<const int64_t> indices) const {
+    const size_t ndims = dims();
+    if (indices.size() != ndims) {
+        throw std::invalid_argument("number of indices must match shape dimensions");
+    }
+
+    if (ndims == 0) {
+        return 0;
+    }
+
+    const auto & values = storage_at(decode_storage_index(index_));
+    int64_t      linear = 0;
+    for (size_t i = 0; i < ndims; ++i) {
+        const int64_t dim_size = values[i];
+        const int64_t index    = indices[i];
+        if (index < 0 || index >= dim_size) {
+            throw std::out_of_range("index is out of bounds for shape dimension");
+        }
+
+        if (dim_size > 0 && i > 0) {
+            if (linear > (std::numeric_limits<int64_t>::max() - index) / dim_size) {
+                throw std::overflow_error("flattened index exceeds int64_t range");
+            }
+        }
+
+        linear = linear * dim_size + index;
+    }
+    return linear;
+}
+
+std::vector<int64_t> Shape::unravel(int64_t index) const {
+    std::vector<int64_t> indices(dims());
+    unravel(index, std::span<int64_t>(indices.data(), indices.size()));
+    return indices;
+}
+
+void Shape::unravel(int64_t index, std::span<int64_t> indices) const {
+    const size_t ndims = dims();
+    if (indices.size() != ndims) {
+        throw std::invalid_argument("index span must match shape dimensions");
+    }
+
+    if (ndims == 0) {
+        if (index != 0) {
+            throw std::out_of_range("scalar shape only supports linear index 0");
+        }
+        return;
+    }
+
+    if (index < 0) {
+        throw std::out_of_range("linear index must be non-negative");
+    }
+
+    const auto & values = storage_at(decode_storage_index(index_));
+    int64_t      linear = index;
+    for (size_t i = ndims; i-- > 0;) {
+        const int64_t dim_size = values[i];
+        indices[i]             = linear % dim_size;
+        linear /= dim_size;
+    }
+
+    if (linear != 0) {
+        throw std::out_of_range("linear index is out of range for shape");
+    }
+}
+
+Shape::operator std::vector<int64_t>() const {
+    const auto & values = storage_at(decode_storage_index(index_));
+    const size_t count  = dims();
+    return std::vector<int64_t>(values.begin(), values.begin() + count);
+}
+
+Shape::operator std::array<int64_t, GGML_MAX_DIMS>() const {
+    return storage_at(decode_storage_index(index_));
+}
+
+uint16_t Shape::store(const std::array<int64_t, GGML_MAX_DIMS> & storage) {
+    auto & mutex   = shape_storage_mutex();
+    auto & entries = shape_storage_entries();
+    auto & map     = shape_storage_map();
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (auto it = map.find(storage); it != map.end()) {
+        return it->second;
+    }
+
+    if (entries.size() >= static_cast<size_t>(Shape::kIndexMask) + 1) {
+        throw std::overflow_error("too many unique shapes");
+    }
+
+    const uint16_t index = static_cast<uint16_t>(entries.size());
+    entries.push_back(storage);
+    map.emplace(storage, index);
+    return index;
+}
+
+const std::array<int64_t, GGML_MAX_DIMS> & Shape::storage_at(uint16_t index) {
+    auto & mutex   = shape_storage_mutex();
+    auto & entries = shape_storage_entries();
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (index >= entries.size()) {
+        throw std::out_of_range("invalid shape storage index");
+    }
+
+    return entries[index];
+}
 
 Config::Config(std::vector<Value> values) {
     values_.reserve(values.size());
@@ -233,9 +419,10 @@ Tensor Tensor::permute_internal(const std::array<int, GGML_MAX_DIMS> & axes) con
     return wrap(ggml_permute(context_->raw(), tensor_, axes[0], axes[1], axes[2], axes[3]));
 }
 
-Tensor Tensor::reshape_internal(const std::array<int64_t, GGML_MAX_DIMS> & shape, int dims) const {
+Tensor Tensor::reshape_internal(const Shape & shape) const {
     require_defined();
     auto * ctx = context_->raw();
+    const auto dims = static_cast<int>(shape.dims());
     switch (dims) {
         case 1:
             return wrap(ggml_reshape_1d(ctx, tensor_, shape[0]));
@@ -250,7 +437,7 @@ Tensor Tensor::reshape_internal(const std::array<int64_t, GGML_MAX_DIMS> & shape
     }
 }
 
-Tensor Tensor::view_with_shape(const std::array<int64_t, GGML_MAX_DIMS> & shape, size_t offset) const {
+Tensor Tensor::view_with_shape(const Shape & shape, size_t offset) const {
     require_defined();
     auto * ctx = context_->raw();
     const int ndims = tensor_ndims(tensor_);
@@ -515,12 +702,12 @@ Tensor Tensor::permute(std::initializer_list<int64_t> dims) const {
 }
 
 Tensor Tensor::reshape(std::initializer_list<int64_t> shape) const {
-    return reshape(std::vector<int64_t>(shape));
+    return reshape(Shape(shape));
 }
 
 Tensor Tensor::reshape(const std::vector<int64_t> & shape) const {
-    auto shape_array = to_shape_array(shape);
-    return reshape_internal(shape_array, static_cast<int>(shape.size()));
+    const Shape target(shape);
+    return reshape_internal(target);
 }
 
 Tensor Tensor::view_as(const Tensor & other) const {
@@ -753,12 +940,10 @@ Tensor Tensor::narrow(int64_t dim, int64_t start, int64_t length) const {
         throw std::out_of_range("narrow length exceeds dimension size");
     }
 
-    std::array<int64_t, GGML_MAX_DIMS> shape{1, 1, 1, 1};
-    for (size_t i = 0; i < dims.size(); ++i) {
-        shape[i] = dims[i];
-    }
-    shape[axis] = length;
+    auto target_dims = dims;
+    target_dims[axis] = length;
     const size_t offset = static_cast<size_t>(start) * tensor_->nb[axis];
+    const Shape shape(target_dims);
     return view_with_shape(shape, offset);
 }
 

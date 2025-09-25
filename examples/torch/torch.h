@@ -12,6 +12,7 @@
 #include <initializer_list>
 #include <map>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -31,6 +32,103 @@ class Config;
 
 class BackendScheduler;
 class Model;
+
+class Shape {
+public:
+    Shape();
+
+    Shape(std::initializer_list<int64_t> dims);
+    explicit Shape(const std::vector<int64_t> & dims);
+
+    static Shape scalar();
+    static Shape vector(int64_t n);
+    static Shape matrix(int64_t rows, int64_t cols);
+
+    template <size_t N>
+    explicit Shape(const std::array<int64_t, N> & dims)
+        : Shape(dims.begin(), dims.end()) {
+    }
+
+    Shape(const int64_t * data, size_t dims);
+
+    const int64_t * data() const { return storage_at(decode_storage_index(index_)).data(); }
+
+    size_t dims() const noexcept { return static_cast<size_t>(decode_dims(index_)); }
+
+    int64_t size(size_t dim) const;
+    int64_t numel() const;
+
+    int64_t operator[](size_t index) const;
+
+    operator std::vector<int64_t>() const;
+    operator std::array<int64_t, GGML_MAX_DIMS>() const;
+    operator const int64_t *() const noexcept { return data(); }
+    operator std::span<const int64_t>() const noexcept { return {data(), dims()}; }
+
+    bool is_scalar() const noexcept { return dims() == 0; }
+    bool is_vector() const noexcept { return dims() == 1; }
+    bool is_matrix() const noexcept { return dims() == 2; }
+
+    int64_t flatten(std::span<const int64_t> indices) const;
+    int64_t flatten(std::initializer_list<int64_t> indices) const {
+        return flatten(std::span<const int64_t>(indices.begin(), indices.size()));
+    }
+
+    std::vector<int64_t> unravel(int64_t index) const;
+    void unravel(int64_t index, std::span<int64_t> indices) const;
+
+    template <typename It>
+    Shape(It begin, It end);
+
+private:
+    static constexpr uint16_t kDimsShift = 13;
+    static constexpr uint16_t kIndexMask = (1u << kDimsShift) - 1;
+
+    static uint16_t store(const std::array<int64_t, GGML_MAX_DIMS> & storage);
+    static const std::array<int64_t, GGML_MAX_DIMS> & storage_at(uint16_t index);
+
+    static constexpr uint16_t encode(uint16_t storage_index, uint8_t dims) noexcept {
+        return static_cast<uint16_t>((static_cast<uint16_t>(dims) << kDimsShift) |
+                                     (storage_index & kIndexMask));
+    }
+
+    static constexpr uint16_t decode_storage_index(uint16_t encoded) noexcept {
+        return static_cast<uint16_t>(encoded & kIndexMask);
+    }
+
+    static constexpr uint8_t decode_dims(uint16_t encoded) noexcept {
+        return static_cast<uint8_t>(encoded >> kDimsShift);
+    }
+
+    uint16_t index_ = 0;
+};
+
+template <typename It>
+Shape::Shape(It begin, It end) {
+    std::array<int64_t, GGML_MAX_DIMS> storage{};
+    storage.fill(1);
+
+    uint8_t dims = 0;
+    for (auto it = begin; it != end; ++it) {
+        if (dims >= GGML_MAX_DIMS) {
+            throw std::invalid_argument("shape expects at most 4 dimensions");
+        }
+
+        const int64_t value = static_cast<int64_t>(*it);
+        if (value <= 0) {
+            throw std::invalid_argument("shape dimensions must be positive");
+        }
+
+        storage[dims++] = value;
+    }
+
+    if (dims == 0) {
+        index_ = encode(0, 0);
+        return;
+    }
+
+    index_ = encode(store(storage), dims);
+}
 
 template <typename T>
 concept KeyPartConcept =
@@ -152,8 +250,8 @@ private:
     void require_broadcastable(const Tensor & other) const;
 
     Tensor permute_internal(const std::array<int, GGML_MAX_DIMS> & axes) const;
-    Tensor reshape_internal(const std::array<int64_t, GGML_MAX_DIMS> & shape, int dims) const;
-    Tensor view_with_shape(const std::array<int64_t, GGML_MAX_DIMS> & shape, size_t offset) const;
+    Tensor reshape_internal(const Shape & shape) const;
+    Tensor view_with_shape(const Shape & shape, size_t offset) const;
     Tensor reduce_rows_like(int64_t dim, bool keepdim, bool mean) const;
 
 private:
