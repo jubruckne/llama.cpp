@@ -8,21 +8,67 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <deque>
 #include <fstream>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <span>
 
 namespace ggml::torch {
 
 namespace {
+
+struct ShapeStorageHash {
+    size_t operator()(const std::array<int64_t, GGML_MAX_DIMS> & storage) const noexcept {
+        size_t seed = 0;
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            const size_t value = std::hash<int64_t>{}(storage[i]);
+            seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+        }
+        return seed;
+    }
+};
+
+using ShapeStorageMap = std::unordered_map<std::array<int64_t, GGML_MAX_DIMS>, uint16_t, ShapeStorageHash>;
+
+std::mutex & shape_storage_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::array<int64_t, GGML_MAX_DIMS> make_scalar_storage() {
+    std::array<int64_t, GGML_MAX_DIMS> storage{};
+    storage.fill(1);
+    return storage;
+}
+
+std::deque<std::array<int64_t, GGML_MAX_DIMS>> & shape_storage_entries() {
+    static std::deque<std::array<int64_t, GGML_MAX_DIMS>> entries = [] {
+        std::deque<std::array<int64_t, GGML_MAX_DIMS>> result;
+        result.push_back(make_scalar_storage());
+        return result;
+    }();
+    return entries;
+}
+
+ShapeStorageMap & shape_storage_map() {
+    static ShapeStorageMap map = [] {
+        ShapeStorageMap result;
+        result.emplace(make_scalar_storage(), 0);
+        return result;
+    }();
+    return map;
+}
 
 [[noreturn]] void throw_bad_context() {
     throw std::runtime_error("ggml::torch tensor operations require tensors to share the same context");
@@ -38,22 +84,9 @@ std::shared_ptr<Context> assert_shared(Context * ctx) {
 
 template <typename It>
 ggml_tensor * new_tensor_from_range(ggml_context * ctx, ggml_type type, It begin, It end) {
-    const auto dims = std::distance(begin, end);
-    if (dims <= 0 || dims > GGML_MAX_DIMS) {
-        throw std::invalid_argument("ggml::torch::Context::new_tensor expects between 1 and 4 dimensions");
-    }
-
-    std::array<int64_t, GGML_MAX_DIMS> ne{};
-    int index = 0;
-    for (auto it = begin; it != end; ++it, ++index) {
-        const auto dim = *it;
-        if (dim <= 0) {
-            throw std::invalid_argument("ggml::torch::Context::new_tensor dimensions must be positive");
-        }
-        ne[index] = dim;
-    }
-
-    return ggml_new_tensor(ctx, type, static_cast<int>(dims), ne.data());
+    const Shape shape(begin, end);
+    const int   ndims = shape.is_scalar() ? 1 : static_cast<int>(shape.dims());
+    return ggml_new_tensor(ctx, type, ndims, shape.data());
 }
 
 int normalize_dim(int64_t dim, int64_t ndims) {
@@ -78,20 +111,21 @@ std::array<int, GGML_MAX_DIMS> identity_axes() {
     return axes;
 }
 
+Shape shape_from_dims(std::initializer_list<int64_t> dims) {
+    return Shape(dims);
+}
+
+Shape shape_from_vector(const std::vector<int64_t> & dims) {
+    return Shape(dims);
+}
+
 std::array<int64_t, GGML_MAX_DIMS> to_shape_array(const std::vector<int64_t> & shape) {
     if (shape.empty() || shape.size() > GGML_MAX_DIMS) {
         throw std::invalid_argument("reshape expects between 1 and 4 dimensions");
     }
-    std::array<int64_t, GGML_MAX_DIMS> result{1, 1, 1, 1};
-    for (size_t i = 0; i < shape.size(); ++i) {
-        if (shape[i] <= 0) {
-            throw std::invalid_argument("tensor dimensions must be positive");
-        }
-        result[i] = shape[i];
-    }
-    return result;
+    const Shape validated(shape);
+    return static_cast<std::array<int64_t, GGML_MAX_DIMS>>(validated);
 }
-
 int tensor_ndims(const ggml_tensor * tensor) {
     int n = ggml_n_dims(tensor);
     return n <= 0 ? 1 : n;
@@ -126,6 +160,182 @@ std::vector<std::string> convert_string_array(const struct gguf_context * ctx, i
 }
 
 } // namespace
+
+Shape::Shape()
+    : index_(encode(0, 0)) {
+}
+
+Shape::Shape(std::initializer_list<int64_t> dims)
+    : Shape(std::span<const int64_t>(dims.begin(), dims.size())) {
+}
+
+Shape::Shape(const std::vector<int64_t> & dims)
+    : Shape(std::span<const int64_t>(dims)) {
+}
+
+Shape::Shape(std::span<const int64_t> dims)
+    : Shape(dims.begin(), dims.end()) {
+}
+
+Shape::Shape(const int64_t * data, size_t dims)
+    : Shape(std::span<const int64_t>(data, dims)) {
+}
+
+Shape Shape::scalar() {
+    return Shape();
+}
+
+Shape Shape::vector(int64_t n) {
+    return Shape{n};
+}
+
+Shape Shape::matrix(int64_t rows, int64_t cols) {
+    return Shape{rows, cols};
+}
+
+int64_t Shape::size(size_t dim) const {
+    const size_t ndims = dims();
+    if (dim >= ndims) {
+        throw std::out_of_range("shape dimension index out of range");
+    }
+    return storage_ref()[dim];
+}
+
+int64_t Shape::numel() const {
+    const auto & values = storage_ref();
+    const size_t count  = dims();
+    int64_t      total  = 1;
+    for (size_t i = 0; i < count; ++i) {
+        const int64_t dim_size = values[i];
+        if (dim_size > 0 &&
+            total > std::numeric_limits<int64_t>::max() / dim_size) {
+            throw std::overflow_error("shape element count exceeds int64_t range");
+        }
+        total *= dim_size;
+    }
+    return total;
+}
+
+int64_t Shape::operator[](size_t index) const {
+    if (index >= dims()) {
+        throw std::out_of_range("shape index out of range");
+    }
+    return storage_ref()[index];
+}
+
+bool Shape::operator==(const Shape & other) const noexcept {
+    return index_ == other.index_;
+}
+
+int64_t Shape::flatten(std::span<const int64_t> indices) const {
+    const size_t ndims = dims();
+    if (indices.size() != ndims) {
+        throw std::invalid_argument("number of indices must match shape dimensions");
+    }
+
+    if (ndims == 0) {
+        return 0;
+    }
+
+    const auto & values = storage_ref();
+    int64_t      linear = 0;
+    for (size_t i = 0; i < ndims; ++i) {
+        const int64_t dim_size = values[i];
+        const int64_t index    = indices[i];
+        if (index < 0 || index >= dim_size) {
+            throw std::out_of_range("index is out of bounds for shape dimension");
+        }
+
+        if (dim_size > 0 && i > 0) {
+            if (linear > (std::numeric_limits<int64_t>::max() - index) / dim_size) {
+                throw std::overflow_error("flattened index exceeds int64_t range");
+            }
+        }
+
+        linear = linear * dim_size + index;
+    }
+    return linear;
+}
+
+std::vector<int64_t> Shape::unravel(int64_t index) const {
+    std::vector<int64_t> indices(dims());
+    unravel(index, std::span<int64_t>(indices.data(), indices.size()));
+    return indices;
+}
+
+void Shape::unravel(int64_t index, std::span<int64_t> indices) const {
+    const size_t ndims = dims();
+    if (indices.size() != ndims) {
+        throw std::invalid_argument("index span must match shape dimensions");
+    }
+
+    if (ndims == 0) {
+        if (index != 0) {
+            throw std::out_of_range("scalar shape only supports linear index 0");
+        }
+        return;
+    }
+
+    if (index < 0) {
+        throw std::out_of_range("linear index must be non-negative");
+    }
+
+    const auto & values = storage_ref();
+    int64_t      linear = index;
+    for (size_t i = ndims; i-- > 0;) {
+        const int64_t dim_size = values[i];
+        indices[i]             = linear % dim_size;
+        linear /= dim_size;
+    }
+
+    if (linear != 0) {
+        throw std::out_of_range("linear index is out of range for shape");
+    }
+}
+
+Shape::operator std::vector<int64_t>() const {
+    const auto & values = storage_ref();
+    const size_t count  = dims();
+    return std::vector<int64_t>(values.begin(), values.begin() + count);
+}
+
+Shape::operator std::array<int64_t, GGML_MAX_DIMS>() const {
+    return storage_ref();
+}
+
+uint16_t Shape::store(const std::array<int64_t, GGML_MAX_DIMS> & storage) {
+    auto & mutex   = shape_storage_mutex();
+    auto & entries = shape_storage_entries();
+    auto & map     = shape_storage_map();
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (auto it = map.find(storage); it != map.end()) {
+        return it->second;
+    }
+
+    if (entries.size() >= Shape::kMaxShapes) {
+        throw std::overflow_error("too many unique shapes");
+    }
+
+    const uint16_t index = static_cast<uint16_t>(entries.size());
+    entries.push_back(storage);
+    map.emplace(storage, index);
+    return index;
+}
+
+const std::array<int64_t, GGML_MAX_DIMS> & Shape::storage_at(uint16_t index) {
+    auto & mutex   = shape_storage_mutex();
+    auto & entries = shape_storage_entries();
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (index >= entries.size()) {
+        throw std::out_of_range("invalid shape storage index");
+    }
+
+    return entries[index];
+}
 
 Config::Config(std::vector<Value> values) {
     values_.reserve(values.size());
@@ -233,9 +443,10 @@ Tensor Tensor::permute_internal(const std::array<int, GGML_MAX_DIMS> & axes) con
     return wrap(ggml_permute(context_->raw(), tensor_, axes[0], axes[1], axes[2], axes[3]));
 }
 
-Tensor Tensor::reshape_internal(const std::array<int64_t, GGML_MAX_DIMS> & shape, int dims) const {
+Tensor Tensor::reshape_internal(const Shape & shape) const {
     require_defined();
     auto * ctx = context_->raw();
+    const auto dims = static_cast<int>(shape.dims());
     switch (dims) {
         case 1:
             return wrap(ggml_reshape_1d(ctx, tensor_, shape[0]));
@@ -250,7 +461,7 @@ Tensor Tensor::reshape_internal(const std::array<int64_t, GGML_MAX_DIMS> & shape
     }
 }
 
-Tensor Tensor::view_with_shape(const std::array<int64_t, GGML_MAX_DIMS> & shape, size_t offset) const {
+Tensor Tensor::view_with_shape(const Shape & shape, size_t offset) const {
     require_defined();
     auto * ctx = context_->raw();
     const int ndims = tensor_ndims(tensor_);
@@ -515,12 +726,12 @@ Tensor Tensor::permute(std::initializer_list<int64_t> dims) const {
 }
 
 Tensor Tensor::reshape(std::initializer_list<int64_t> shape) const {
-    return reshape(std::vector<int64_t>(shape));
+    return reshape(Shape(shape));
 }
 
 Tensor Tensor::reshape(const std::vector<int64_t> & shape) const {
-    auto shape_array = to_shape_array(shape);
-    return reshape_internal(shape_array, static_cast<int>(shape.size()));
+    const Shape target(shape);
+    return reshape_internal(target);
 }
 
 Tensor Tensor::view_as(const Tensor & other) const {
@@ -753,12 +964,10 @@ Tensor Tensor::narrow(int64_t dim, int64_t start, int64_t length) const {
         throw std::out_of_range("narrow length exceeds dimension size");
     }
 
-    std::array<int64_t, GGML_MAX_DIMS> shape{1, 1, 1, 1};
-    for (size_t i = 0; i < dims.size(); ++i) {
-        shape[i] = dims[i];
-    }
-    shape[axis] = length;
+    auto target_dims = dims;
+    target_dims[axis] = length;
     const size_t offset = static_cast<size_t>(start) * tensor_->nb[axis];
+    const Shape shape(target_dims);
     return view_with_shape(shape, offset);
 }
 
@@ -1445,119 +1654,94 @@ BackendBuffer Context::allocate_tensors(ggml_backend_buffer_type_t buffer_type) 
     return BackendBuffer(buffer);
 }
 
+std::string qualify_name(std::string_view base, std::string_view name) {
+    if (base.empty()) {
+        return std::string{name};
+    }
+    if (name.empty()) {
+        return std::string{base};
+    }
+    std::string qualified;
+    qualified.reserve(base.size() + 1 + name.size());
+    qualified.append(base);
+    qualified.push_back('.');
+    qualified.append(name);
+    return qualified;
+}
+
 namespace nn {
 
-Module::Module(const Model * model)
-    : model_(model) {
+Module::Module(const Model * model, std::string name)
+    : model_(model), name_(std::move(name)) {
     if (!model_) {
         throw std::invalid_argument("ggml::torch::nn::Module requires an owning model");
     }
 }
 
-Tensor & Module::register_parameter(const std::string & name, const Tensor & tensor) {
-    if (!tensor.defined()) {
-        throw std::invalid_argument("cannot register undefined tensor as parameter");
+Model & Module::model() {
+    if (!model_) {
+        throw std::runtime_error("ggml::torch::nn::Module is not associated with a model");
     }
-    auto inserted = parameters_.emplace(name, tensor);
-    if (!inserted.second) {
-        inserted.first->second = tensor;
-    }
-    return inserted.first->second;
+    return const_cast<Model &>(*model_);
 }
 
-Tensor & Module::register_buffer(const std::string & name, const Tensor & tensor) {
-    if (!tensor.defined()) {
-        throw std::invalid_argument("cannot register undefined tensor as buffer");
+const Model & Module::model() const {
+    if (!model_) {
+        throw std::runtime_error("ggml::torch::nn::Module is not associated with a model");
     }
-    auto inserted = buffers_.emplace(name, tensor);
-    if (!inserted.second) {
-        inserted.first->second = tensor;
-    }
-    return inserted.first->second;
+    return *model_;
 }
 
-std::shared_ptr<Module> Module::register_module(const std::string & name, std::shared_ptr<Module> module) {
-    if (!module) {
-        throw std::invalid_argument("cannot register null module");
+Tensor & Module::register_parameter(const std::string & name,
+                                    std::optional<Shape> shape,
+                                    std::optional<ggml_type> type) {
+    if (!model_) {
+        throw std::runtime_error("cannot register parameter without an owning model");
     }
-    if (module->model_ != model_) {
-        throw std::invalid_argument("registered module must belong to the same model instance");
+    if (name.empty()) {
+        throw std::invalid_argument("parameter name must be non-empty");
     }
-    modules_[name] = std::move(module);
-    return modules_[name];
+    const std::string qualified = qualify_name(name_, name);
+    Tensor & tensor = model().register_parameter(qualified, std::move(shape), std::move(type));
+    return tensor;
 }
 
-std::vector<Tensor> Module::parameters(bool recurse) const {
-    std::vector<Tensor> result;
-    result.reserve(parameters_.size());
-    for (const auto & kv : parameters_) {
-        result.push_back(kv.second);
+Tensor & Module::register_buffer(const std::string & name, Shape shape, ggml_type type) {
+    if (!model_) {
+        throw std::runtime_error("cannot register buffer without an owning model");
     }
-    if (recurse) {
-        for (const auto & kv : modules_) {
-            auto child = kv.second;
-            if (child) {
-                auto child_params = child->parameters(true);
-                result.insert(result.end(), child_params.begin(), child_params.end());
-            }
-        }
+    if (name.empty()) {
+        throw std::invalid_argument("buffer name must be non-empty");
     }
-    return result;
-}
-
-std::vector<std::pair<std::string, Tensor>> Module::named_parameters(bool recurse) const {
-    std::vector<std::pair<std::string, Tensor>> result;
-    for (const auto & kv : parameters_) {
-        result.emplace_back(kv.first, kv.second);
-    }
-    if (recurse) {
-        for (const auto & kv : modules_) {
-            const auto & prefix = kv.first;
-            const auto & module = kv.second;
-            if (!module) {
-                continue;
-            }
-            for (const auto & child : module->named_parameters(true)) {
-                result.emplace_back(prefix + "." + child.first, child.second);
-            }
-        }
-    }
-    return result;
-}
-
-std::vector<Tensor> Module::buffers(bool recurse) const {
-    std::vector<Tensor> result;
-    for (const auto & kv : buffers_) {
-        result.push_back(kv.second);
-    }
-    if (recurse) {
-        for (const auto & kv : modules_) {
-            const auto & module = kv.second;
-            if (module) {
-                auto child_buffers = module->buffers(true);
-                result.insert(result.end(), child_buffers.begin(), child_buffers.end());
-            }
-        }
-    }
-    return result;
+    const std::string qualified = qualify_name(name_, name);
+    Tensor & tensor = model().register_buffer(qualified, std::move(shape), type);
+    return tensor;
 }
 
 } // namespace nn
 
-Linear::Linear(const Model & model,
+Linear::Linear(Model & model,
                int64_t in_features,
                int64_t out_features,
                bool bias,
                ggml_type type)
-    : Module(&model), in_features_(in_features), out_features_(out_features) {
+    : Linear(model, std::string{}, in_features, out_features, bias, type) {
+}
+
+Linear::Linear(Model & model,
+               std::string name,
+               int64_t in_features,
+               int64_t out_features,
+               bool bias,
+               ggml_type type)
+    : Module(&model, std::move(name)), in_features_(in_features), out_features_(out_features) {
     if (in_features <= 0 || out_features <= 0) {
         throw std::invalid_argument("ggml::torch::Linear requires positive feature sizes");
     }
 
-    const Context * ctx = model.ctx();
-    weight_ = register_parameter("weight", ctx->new_tensor(type, {in_features, out_features}));
+    weight_ = register_parameter("weight", shape_from_dims({in_features, out_features}), type);
     if (bias) {
-        bias_ = register_parameter("bias", ctx->new_tensor(type, {out_features}));
+        bias_ = register_parameter("bias", shape_from_dims({out_features}), type);
     }
 }
 
@@ -1576,10 +1760,17 @@ Tensor Linear::forward(const Tensor & input) {
     return output;
 }
 
-RotaryEmbedding::RotaryEmbedding(const Model & model,
+RotaryEmbedding::RotaryEmbedding(Model & model,
                                  int64_t dims,
                                  Tensor::RopeConfig rope_config)
-    : Module(&model), dims_(dims), config_(rope_config) {
+    : RotaryEmbedding(model, std::string{}, dims, rope_config) {
+}
+
+RotaryEmbedding::RotaryEmbedding(Model & model,
+                                 std::string name,
+                                 int64_t dims,
+                                 Tensor::RopeConfig rope_config)
+    : Module(&model, std::move(name)), dims_(dims), config_(rope_config) {
     if (dims_ <= 0) {
         throw std::invalid_argument("ggml::torch::RotaryEmbedding requires a positive dimension");
     }
@@ -1625,17 +1816,23 @@ std::pair<Tensor, Tensor> RotaryEmbedding::apply(const Tensor & query,
     return {rotated_query, rotated_key};
 }
 
-Embedding::Embedding(const Model & model,
+Embedding::Embedding(Model & model,
                      int64_t num_embeddings,
                      int64_t embedding_dim,
                      ggml_type type)
-    : Module(&model), num_embeddings_(num_embeddings), embedding_dim_(embedding_dim) {
+    : Embedding(model, std::string{}, num_embeddings, embedding_dim, type) {
+}
+
+Embedding::Embedding(Model & model,
+                     std::string name,
+                     int64_t num_embeddings,
+                     int64_t embedding_dim,
+                     ggml_type type)
+    : Module(&model, std::move(name)), num_embeddings_(num_embeddings), embedding_dim_(embedding_dim) {
     if (num_embeddings <= 0 || embedding_dim <= 0) {
         throw std::invalid_argument("ggml::torch::Embedding requires positive dimensions");
     }
-
-    const Context * ctx = model.ctx();
-    weight_ = register_parameter("weight", ctx->new_tensor(type, {embedding_dim, num_embeddings}));
+    weight_ = register_parameter("weight", shape_from_dims({embedding_dim, num_embeddings}), type);
 }
 
 Tensor Embedding::forward(const Tensor & input) {
@@ -1649,12 +1846,21 @@ Tensor Embedding::forward(const Tensor & input) {
     return weight_.index_select(input);
 }
 
-LayerNorm::LayerNorm(const Model & model,
+LayerNorm::LayerNorm(Model & model,
                      std::vector<int64_t> normalized_shape,
                      float eps,
                      bool elementwise_affine,
                      ggml_type type)
-    : Module(&model),
+    : LayerNorm(model, std::string{}, std::move(normalized_shape), eps, elementwise_affine, type) {
+}
+
+LayerNorm::LayerNorm(Model & model,
+                     std::string name,
+                     std::vector<int64_t> normalized_shape,
+                     float eps,
+                     bool elementwise_affine,
+                     ggml_type type)
+    : Module(&model, std::move(name)),
       normalized_shape_(std::move(normalized_shape)),
       eps_(eps),
       elementwise_affine_(elementwise_affine) {
@@ -1663,9 +1869,8 @@ LayerNorm::LayerNorm(const Model & model,
     }
 
     if (elementwise_affine_) {
-        const Context * ctx = model.ctx();
-        weight_ = register_parameter("weight", ctx->new_tensor(type, normalized_shape_));
-        bias_   = register_parameter("bias",   ctx->new_tensor(type, normalized_shape_));
+        weight_ = register_parameter("weight", shape_from_vector(normalized_shape_), type);
+        bias_   = register_parameter("bias",   shape_from_vector(normalized_shape_), type);
     }
 }
 
@@ -1687,17 +1892,24 @@ Tensor LayerNorm::forward(const Tensor & input) {
     return result;
 }
 
-RMSNorm::RMSNorm(const Model & model,
+RMSNorm::RMSNorm(Model & model,
                  int64_t normalized_shape,
                  float eps,
                  ggml_type type)
-    : Module(&model), eps_(eps) {
+    : RMSNorm(model, std::string{}, normalized_shape, eps, type) {
+}
+
+RMSNorm::RMSNorm(Model & model,
+                 std::string name,
+                 int64_t normalized_shape,
+                 float eps,
+                 ggml_type type)
+    : Module(&model, std::move(name)), eps_(eps) {
     if (normalized_shape <= 0) {
         throw std::invalid_argument("ggml::torch::RMSNorm requires a positive normalized_shape");
     }
 
-    const Context * ctx = model.ctx();
-    weight_ = register_parameter("weight", ctx->new_tensor(type, {normalized_shape}));
+    weight_ = register_parameter("weight", shape_from_dims({normalized_shape}), type);
 }
 
 Tensor RMSNorm::forward(const Tensor & input) {
@@ -1712,10 +1924,6 @@ Tensor RMSNorm::forward(const Tensor & input) {
     return result.mul(weight_.repeat_like(result));
 }
 
-ReLU::ReLU(const Model & model)
-    : Module(&model) {
-}
-
 Tensor ReLU::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::ReLU::forward requires a defined input tensor");
@@ -1724,10 +1932,6 @@ Tensor ReLU::forward(const Tensor & input) {
         throw std::invalid_argument("ggml::torch::ReLU::forward expects the input tensor to originate from the same context");
     }
     return input.relu();
-}
-
-SiLU::SiLU(const Model & model)
-    : Module(&model) {
 }
 
 Tensor SiLU::forward(const Tensor & input) {
@@ -1740,8 +1944,8 @@ Tensor SiLU::forward(const Tensor & input) {
     return input.silu();
 }
 
-GELU::GELU(const Model & model, bool approximate)
-    : Module(&model), approximate_(approximate) {
+GELU::GELU(Model & model, std::string name, bool approximate)
+    : Module(&model, std::move(name)), approximate_(approximate) {
 }
 
 Tensor GELU::forward(const Tensor & input) {
@@ -1754,10 +1958,6 @@ Tensor GELU::forward(const Tensor & input) {
     return input.gelu(approximate_);
 }
 
-Sigmoid::Sigmoid(const Model & model)
-    : Module(&model) {
-}
-
 Tensor Sigmoid::forward(const Tensor & input) {
     if (!input.defined()) {
         throw std::invalid_argument("ggml::torch::Sigmoid::forward requires a defined input tensor");
@@ -1766,10 +1966,6 @@ Tensor Sigmoid::forward(const Tensor & input) {
         throw std::invalid_argument("ggml::torch::Sigmoid::forward expects the input tensor to originate from the same context");
     }
     return input.sigmoid();
-}
-
-Tanh::Tanh(const Model & model)
-    : Module(&model) {
 }
 
 Tensor Tanh::forward(const Tensor & input) {
@@ -1782,8 +1978,8 @@ Tensor Tanh::forward(const Tensor & input) {
     return input.tanh();
 }
 
-ELU::ELU(const Model & model, float alpha)
-    : Module(&model), alpha_(alpha) {
+ELU::ELU(Model & model, std::string name, float alpha)
+    : Module(&model, std::move(name)), alpha_(alpha) {
     if (!std::isfinite(alpha_)) {
         throw std::invalid_argument("ggml::torch::ELU requires a finite alpha value");
     }
@@ -1802,8 +1998,8 @@ Tensor ELU::forward(const Tensor & input) {
     return input.elu();
 }
 
-LeakyReLU::LeakyReLU(const Model & model, float negative_slope)
-    : Module(&model), negative_slope_(negative_slope) {
+LeakyReLU::LeakyReLU(Model & model, std::string name, float negative_slope)
+    : Module(&model, std::move(name)), negative_slope_(negative_slope) {
     if (!std::isfinite(negative_slope_)) {
         throw std::invalid_argument("ggml::torch::LeakyReLU requires a finite negative slope");
     }
@@ -1819,8 +2015,8 @@ Tensor LeakyReLU::forward(const Tensor & input) {
     return input.leaky_relu(negative_slope_);
 }
 
-Softmax::Softmax(const Model & model, int64_t dim)
-    : Module(&model), dim_(dim) {
+Softmax::Softmax(Model & model, std::string name, int64_t dim)
+    : Module(&model, std::move(name)), dim_(dim) {
 }
 
 Tensor Softmax::forward(const Tensor & input) {
@@ -1840,24 +2036,30 @@ Tensor Softmax::forward(const Tensor & input) {
     return input.softmax(axis);
 }
 
-FeedForward::FeedForward(const Model & model,
+FeedForward::FeedForward(Model & model,
                          int64_t embed_dim,
                          int64_t hidden_dim,
                          bool gated,
                          ggml_type type)
-    : Module(&model), gated_(gated) {
+    : FeedForward(model, std::string{}, embed_dim, hidden_dim, gated, type) {
+}
+
+FeedForward::FeedForward(Model & model,
+                         std::string name,
+                         int64_t embed_dim,
+                         int64_t hidden_dim,
+                         bool gated,
+                         ggml_type type)
+    : Module(&model, std::move(name)), gated_(gated) {
     if (embed_dim <= 0 || hidden_dim <= 0) {
         throw std::invalid_argument("ggml::torch::FeedForward requires positive dimensions");
     }
 
-    up_proj_   = std::make_shared<Linear>(model, embed_dim, hidden_dim, true, type);
-    down_proj_ = std::make_shared<Linear>(model, hidden_dim, embed_dim, true, type);
-    register_module("up_proj", up_proj_);
-    register_module("down_proj", down_proj_);
+    up_proj_   = register_module<Linear>("up_proj", embed_dim, hidden_dim, true, type);
+    down_proj_ = register_module<Linear>("down_proj", hidden_dim, embed_dim, true, type);
 
     if (gated_) {
-        gate_proj_ = std::make_shared<Linear>(model, embed_dim, hidden_dim, true, type);
-        register_module("gate_proj", gate_proj_);
+        gate_proj_ = register_module<Linear>("gate_proj", embed_dim, hidden_dim, true, type);
     }
 }
 
@@ -1879,13 +2081,23 @@ Tensor FeedForward::forward(const Tensor & input) {
     return down_proj_->forward(hidden);
 }
 
-MultiheadAttention::MultiheadAttention(const Model & model,
+MultiheadAttention::MultiheadAttention(Model & model,
                                        int64_t embed_dim,
                                        int64_t num_heads,
                                        bool bias,
                                        ggml_type type,
                                        Tensor::RopeConfig rope)
-    : Module(&model),
+    : MultiheadAttention(model, std::string{}, embed_dim, num_heads, bias, type, rope) {
+}
+
+MultiheadAttention::MultiheadAttention(Model & model,
+                                       std::string name,
+                                       int64_t embed_dim,
+                                       int64_t num_heads,
+                                       bool bias,
+                                       ggml_type type,
+                                       Tensor::RopeConfig rope)
+    : Module(&model, std::move(name)),
       embed_dim_(embed_dim),
       num_heads_(num_heads),
       rope_(rope) {
@@ -1901,15 +2113,10 @@ MultiheadAttention::MultiheadAttention(const Model & model,
         rope_.n_dims = static_cast<int>(head_dim_);
     }
 
-    q_proj_ = std::make_shared<Linear>(model, embed_dim_, embed_dim_, bias, type);
-    k_proj_ = std::make_shared<Linear>(model, embed_dim_, embed_dim_, bias, type);
-    v_proj_ = std::make_shared<Linear>(model, embed_dim_, embed_dim_, bias, type);
-    o_proj_ = std::make_shared<Linear>(model, embed_dim_, embed_dim_, bias, type);
-
-    register_module("q_proj", q_proj_);
-    register_module("k_proj", k_proj_);
-    register_module("v_proj", v_proj_);
-    register_module("o_proj", o_proj_);
+    q_proj_ = register_module<Linear>("q_proj", embed_dim_, embed_dim_, bias, type);
+    k_proj_ = register_module<Linear>("k_proj", embed_dim_, embed_dim_, bias, type);
+    v_proj_ = register_module<Linear>("v_proj", embed_dim_, embed_dim_, bias, type);
+    o_proj_ = register_module<Linear>("o_proj", embed_dim_, embed_dim_, bias, type);
 }
 
 Tensor MultiheadAttention::forward(const Tensor & input) {
@@ -1964,17 +2171,8 @@ Tensor MultiheadAttention::forward(const Tensor & input) {
     return output;
 }
 
-Sequential::Sequential(const Model & model)
-    : Module(&model) {
-}
-
-Sequential::Sequential(const Model & model,
-                       std::initializer_list<std::shared_ptr<Module>> modules)
-    : Sequential(model) {
-    size_t index = 0;
-    for (auto module : modules) {
-        append(std::to_string(index++), std::move(module));
-    }
+Sequential::Sequential(Model & model, std::string name)
+    : Module(&model, std::move(name)) {
 }
 
 Tensor Sequential::forward(const Tensor & input) {
@@ -1992,16 +2190,6 @@ Tensor Sequential::forward(const Tensor & input) {
         }
     }
     return current;
-}
-
-Sequential & Sequential::append(const std::string & name, std::shared_ptr<Module> module) {
-    ordered_modules_.emplace_back(name, register_module(name, std::move(module)));
-    return *this;
-}
-
-Sequential & Sequential::append(std::shared_ptr<Module> module) {
-    const auto name = std::to_string(ordered_modules_.size());
-    return append(name, std::move(module));
 }
 
 namespace {
@@ -2065,16 +2253,68 @@ std::shared_ptr<Context> Model::shared_context() const {
     return context_;
 }
 
-std::vector<Tensor> Model::parameters(bool recurse) const {
-    return module().parameters(recurse);
+const std::map<std::string, Tensor> & Model::parameters() const {
+    return parameters_;
 }
 
-std::vector<std::pair<std::string, Tensor>> Model::named_parameters(bool recurse) const {
-    return module().named_parameters(recurse);
+const std::map<std::string, Tensor> & Model::buffers() const {
+    return buffers_;
 }
 
-std::vector<Tensor> Model::buffers(bool recurse) const {
-    return module().buffers(recurse);
+Tensor & Model::register_parameter(const std::string & name,
+                                   std::optional<Shape> shape,
+                                   std::optional<ggml_type> type) {
+    if (name.empty()) {
+        throw std::invalid_argument("parameter name must be non-empty");
+    }
+
+    if (!config_.contains("tensor", name)) {
+        throw std::invalid_argument("parameter '" + name + "' not found in model configuration");
+    }
+
+    const auto & info = config_.get<TensorInfo>("tensor", name);
+    if (shape && *shape != info.shape) {
+        throw std::invalid_argument("parameter '" + name + "' shape does not match configuration");
+    }
+    if (type && *type != info.type) {
+        throw std::invalid_argument("parameter '" + name + "' type does not match configuration");
+    }
+
+    auto [it, inserted] = parameters_.try_emplace(name);
+    if (!inserted && it->second.defined()) {
+        throw std::invalid_argument("parameter '" + name + "' is already registered");
+    }
+
+    it->second = context_->new_tensor(info.type, shape_to_dims(info.shape));
+    if (!info.name.empty()) {
+        ggml_set_name(it->second.raw(), info.name.c_str());
+    }
+    return it->second;
+}
+
+Tensor & Model::register_buffer(const std::string & name, Shape shape, ggml_type type) {
+    if (name.empty()) {
+        throw std::invalid_argument("buffer name must be non-empty");
+    }
+    auto [it, inserted] = buffers_.try_emplace(name);
+    if (!inserted && it->second.defined()) {
+        throw std::invalid_argument("buffer '" + name + "' is already registered");
+    }
+
+    it->second = context_->new_tensor(type, shape_to_dims(shape));
+    return it->second;
+}
+
+std::vector<int64_t> Model::shape_to_dims(const Shape & shape) {
+    auto values = static_cast<std::array<int64_t, GGML_MAX_DIMS>>(shape);
+    int  dims   = static_cast<int>(shape.dims());
+    if (dims <= 0) {
+        dims = 1;
+    }
+    while (dims > 1 && values[static_cast<size_t>(dims - 1)] == 1) {
+        --dims;
+    }
+    return std::vector<int64_t>(values.begin(), values.begin() + dims);
 }
 
 Generator::Generator(std::shared_ptr<Model> model, std::vector<BackendBuffer> parameter_buffers)
@@ -2141,8 +2381,8 @@ void Generator::collect_tensor_placements(const GenerationWorkspace & workspace,
                                           std::vector<std::pair<Tensor, size_t>> & placements) const {
     placements.clear();
 
-    const auto params  = model_->named_parameters(true);
-    const auto buffers = model_->buffers(true);
+    const auto & params  = model_->parameters();
+    const auto & buffers = model_->buffers();
     placements.reserve(params.size() + buffers.size());
 
     auto record_tensor = [&](const Tensor & tensor) {
@@ -2164,8 +2404,8 @@ void Generator::collect_tensor_placements(const GenerationWorkspace & workspace,
     for (const auto & entry : params) {
         record_tensor(entry.second);
     }
-    for (const auto & tensor : buffers) {
-        record_tensor(tensor);
+    for (const auto & entry : buffers) {
+        record_tensor(entry.second);
     }
 }
 
@@ -2522,11 +2762,11 @@ Config Loader::load_config_from_gguf(const std::string & path) {
 
         std::string tensor_name_str(tensor_name);
         TensorInfo tensor_info{};
-        tensor_info.name = tensor_name_str;
-        tensor_info.type = tensor_meta->type;
-        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-            tensor_info.shape[d] = tensor_meta->ne[d];
-        }
+        tensor_info.name  = tensor_name_str;
+        tensor_info.type  = tensor_meta->type;
+        const int ndims   = ggml_n_dims(tensor_meta);
+        const size_t dims = ndims > 0 ? static_cast<size_t>(ndims) : 0;
+        tensor_info.shape = Shape(tensor_meta->ne, dims);
 
         values.emplace_back("tensor." + tensor_name_str, std::move(tensor_info));
     }
@@ -2556,14 +2796,12 @@ std::vector<BackendBuffer> Loader::load_weights_from_gguf(Model & model,
         throw std::runtime_error("failed to open GGUF file for reading tensor data");
     }
 
-    const auto parameters = model.named_parameters(true);
+    const auto & parameters = model.parameters();
 
     std::unordered_map<Backend *, std::vector<Tensor>> allocations;
     allocations.reserve(parameters.size());
 
-    for (const auto & entry : parameters) {
-        const auto & name = entry.first;
-        const auto & tensor = entry.second;
+    for (const auto & [name, tensor] : parameters) {
         if (!tensor.defined()) {
             throw std::runtime_error("encountered undefined parameter while loading weights");
         }
